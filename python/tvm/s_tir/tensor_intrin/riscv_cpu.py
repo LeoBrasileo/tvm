@@ -27,8 +27,15 @@ from tvm.script import tirx as T
 from tvm.target.codegen import Target, llvm_get_vector_width, target_has_features
 
 from .. import TensorIntrin
+from .riscv_approximations_cpu import rvv_sigmoid_kernel, rvv_log_kernel, rvv_exp_kernel
 
 logger = logging.getLogger(__name__)
+
+# --- masks and common parameters ---
+READ, WRITE = 1, 2 #0b01, 0b10
+def mask_llvm(dtype: str):
+    """Returns LLVM intrinsic mask arguments for a given dtype."""
+    return (T.uint64(0b111),) if dtype.startswith("float") else ()
 
 
 def get_max_elems(vlen: int, lmul: int, sew: int) -> int:
@@ -97,8 +104,6 @@ def rvv_vec_dot_product_kernels(
     # data type widening case
     o_dtype_lanes = max(o_dtype_lanes, 2)
 
-    mask_args = () if data_dtype[0] in ("i", "u") else (T.uint64(7),)
-
     wide_dtype = out_dtype
     if DataType(out_dtype).bits > DataType(data_dtype).bits:
         wide_dtype = "".join(c for c in data_dtype if not c.isdigit())
@@ -142,7 +147,7 @@ def rvv_vec_dot_product_kernels(
                         T.broadcast(T.Cast(wide_dtype, 0), T.vscale() * w_dtype_lanes),
                         vec_B_row,
                         vec_A,
-                        *mask_args,
+                        *mask_llvm(data_dtype),
                         T.uint64(n_elems))
 
                     ini_acc = T.call_llvm_intrin(
@@ -159,7 +164,7 @@ def rvv_vec_dot_product_kernels(
                         T.broadcast(T.Cast(out_dtype, 0), T.vscale() * o_dtype_lanes),
                         product,
                         ini_acc,
-                        *mask_args,
+                        *mask_llvm(data_dtype),
                         T.uint64(n_elems))
 
                     C[i] = T.call_llvm_intrin(
@@ -169,6 +174,232 @@ def rvv_vec_dot_product_kernels(
                         red_sum)
     # fmt: on
     return rvv_vec_dot_prod_desc, rvv_vec_dot_prod_impl
+
+
+def rvv_add_kernel(
+    n_elems: int,
+    dtype: str,
+    lmul: int,
+):
+    """Element-wise vector add using RISC-V vector instructions.
+
+    Computes C[n_elems] = A[n_elems] + B[n_elems] using vfadd (float)
+    or vadd (integer) via explicit LLVM RVV intrinsics, bypassing
+    TVM's VectorizeLoop + CreateFAdd path entirely.
+
+    Args:
+        n_elems (int): Number of elements (must fit in lmul vector registers)
+        dtype   (str): Element dtype, e.g. "float32", "int32"
+        lmul    (int): LMUL register group multiplier
+    """
+    dt = DataType(dtype)
+    # TVM cannot encode `vscale * 1` (it folds to a bare vscale),
+    # so the min-lane count must stay >= 2.
+    dtype_lanes = max((64 // dt.bits) * lmul, 2)
+
+    vec_dtype = f"{dtype}xvscalex{dtype_lanes}"
+
+    # Select intrinsic: vfadd for float, vadd for integer
+    is_float = dtype.startswith("float")
+    add_intrin = "llvm.riscv.vfadd" if is_float else "llvm.riscv.vadd"
+
+    # ── descriptor ────────────────────────────────────────────────────────────
+    @T.prim_func(s_tir=True)
+    def rvv_add_desc(
+        A: T.Buffer((n_elems,), dtype, offset_factor=1),
+        B: T.Buffer((n_elems,), dtype, offset_factor=1),
+        C: T.Buffer((n_elems,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems], B[0:n_elems])
+            T.writes(C[0:n_elems])
+            for i in T.serial(0, n_elems):
+                with T.sblock("update"):
+                    vi = T.axis.remap("S", [i])
+                    C[vi] = A[vi] + B[vi]
+
+    # ── implementation ────────────────────────────────────────────────────────
+    # fmt: off
+    @T.prim_func(s_tir=True)
+    def rvv_add_impl(
+        A: T.Buffer((n_elems,), dtype, offset_factor=1),
+        B: T.Buffer((n_elems,), dtype, offset_factor=1),
+        C: T.Buffer((n_elems,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems], B[0:n_elems])
+            T.writes(C[0:n_elems])
+
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vle",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                T.tvm_access_ptr(T.type_annotation(dtype), A.data, A.elem_offset, n_elems, READ),
+                T.int64(n_elems),
+            )
+
+            vec_B = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vle",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                T.tvm_access_ptr(T.type_annotation(dtype), B.data, B.elem_offset, n_elems, READ),
+                T.int64(n_elems),
+            )
+
+            vec_C = T.call_llvm_intrin(
+                vec_dtype,
+                add_intrin,
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                vec_A,
+                vec_B,
+                *mask_llvm(dtype),
+                T.int64(n_elems),
+            )
+
+            T.call_llvm_intrin(
+                "void",
+                "llvm.riscv.vse",
+                vec_C,
+                T.tvm_access_ptr(T.type_annotation(dtype), C.data, C.elem_offset, n_elems, WRITE),
+                T.int64(n_elems),
+            )
+    # fmt: on
+    return rvv_add_desc, rvv_add_impl
+
+
+def rvv_copy_kernel(n_elems: int, dtype: str, lmul: int):
+    """Implementation of a plain scalar copy loop over n_elems elements
+    for concatenating using RISC-V vector instructions.
+
+    The descriptor is a plain scalar copy loop over n_elems elements.
+    The implementation replaces it with a single vle + vse pair.
+    Two-buffer signature (A -> C).
+    """
+    dt = DataType(dtype)
+    dtype_lanes = max((64 // dt.bits) * lmul, 2)
+    vec_dtype = f"{dtype}xvscalex{dtype_lanes}"
+
+    @T.prim_func(s_tir=True)
+    def rvv_copy_desc(
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((n_elems,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems])
+            T.writes(C[0:n_elems])
+            for i in T.serial(0, n_elems):
+                with T.sblock("update"):
+                    vi = T.axis.remap("S", [i])
+                    C[vi] = A[vi]
+
+    # fmt: off
+    @T.prim_func(s_tir=True)
+    def rvv_copy_impl(
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((n_elems,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems])
+            T.writes(C[0:n_elems])
+
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vle",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                T.tvm_access_ptr(T.type_annotation(dtype), A.data, A.elem_offset, n_elems, READ),
+                T.int64(n_elems),
+            )
+            T.call_llvm_intrin(
+                "void",
+                "llvm.riscv.vse",
+                vec_A,
+                T.tvm_access_ptr(T.type_annotation(dtype), C.data, C.elem_offset, n_elems, WRITE),
+                T.int64(n_elems),
+            )
+
+    # fmt: on
+
+    return rvv_copy_desc, rvv_copy_impl
+
+def rvv_neg_kernel(
+    n_elems: int,
+    dtype: str,
+    lmul: int,
+):
+    """Element-wise vector negative using RISC-V vector instructions.
+
+    Args:
+        n_elems (int): Number of elements (must fit in lmul vector registers)
+        dtype (str): Element dtype, e.g. "float32", "int32"
+        lmul (int): LMUL register group multiplier
+    """
+    dt = DataType(dtype)
+    dtype_lanes = max((64 // dt.bits) * lmul, 2)
+
+    # for uint input, the signed counterpart is used for output and vsub
+    is_uint = dtype.startswith("uint")
+    signed_dtype = f"int{dt.bits}" if is_uint else dtype
+    out_dtype = signed_dtype
+
+    vec_dtype = f"{dtype}xvscalex{dtype_lanes}"
+
+    # ── descriptor ────────────────────────────────────────────────────────────
+    @T.prim_func(s_tir=True)
+    def rvv_neg_desc(
+        A: T.Buffer((n_elems,), dtype, offset_factor=1),
+        B: T.Buffer((n_elems,), out_dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems])
+            T.writes(B[0:n_elems])
+            for i in T.serial(0, n_elems):
+                with T.sblock("update"):
+                    vi = T.axis.remap("S", [i])
+                    if is_uint:
+                        B[vi] = T.Cast(out_dtype, A[vi]) * getattr(T, out_dtype)(-1)
+                    else:
+                        B[vi] = A[vi] * getattr(T, dtype)(-1)
+
+    # ── implementation ────────────────────────────────────────────────────────
+    vec_broadcast = T.broadcast(T.Cast(signed_dtype, 0), T.vscale() * dtype_lanes)
+
+    # fmt: off
+    @T.prim_func(s_tir=True)
+    def rvv_neg_impl(
+        A: T.Buffer((n_elems,), dtype, offset_factor=1),
+        B: T.Buffer((n_elems,), out_dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems])
+            T.writes(B[0:n_elems])
+
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vle",
+                vec_broadcast,
+                T.tvm_access_ptr(T.type_annotation(dtype), A.data, A.elem_offset, n_elems, READ),
+                T.int64(n_elems),
+            )
+
+            vec_neg_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfsub" if dtype.startswith("float") else "llvm.riscv.vsub",
+                T.broadcast(getattr(T, signed_dtype)(0), T.vscale() * dtype_lanes),
+                T.broadcast(getattr(T, signed_dtype)(0), T.vscale() * dtype_lanes),
+                vec_A,
+                *mask_llvm(signed_dtype),
+                T.int64(n_elems),
+            )
+
+            T.call_llvm_intrin(
+                "void",
+                "llvm.riscv.vse",
+                vec_neg_A,
+                T.tvm_access_ptr(T.type_annotation(out_dtype), B.data, B.elem_offset, n_elems, WRITE),
+                T.int64(n_elems),
+            )
+    # fmt: on
+    return rvv_neg_desc, rvv_neg_impl
 
 
 @tvm_ffi.register_global_func("tirx.tensor_intrin.register_rvv_isa_intrinsics")
@@ -223,6 +454,66 @@ def register_rvv_isa_intrinsics(target: Target, inventory_only=False) -> dict():
                     n_elems, n_lanes, d_dtype, w_dtype, o_dtype, lmul
                 )
                 TensorIntrin.register(kernel_name, desc, impl, override=True)
+
+            n_elems //= 2
+
+    # ── Spatial Kernels ────────────────────────────────────────────────────────
+    dtypes = ["uint8", "uint16", "uint32", "uint64",
+              "int8", "int16", "int32", "int64",
+              "float16", "float32", "float64"]
+    for dtype in dtypes:
+        dt = DataType(dtype)
+        max_elems = get_max_elems(vlen, lmul=8, sew=dt.bits)
+
+        n_elems = max_elems
+        while n_elems >= 4:
+            # size LMUL to the tile so the register group matches n_elems
+            lmul = max(1, n_elems // (vlen // dt.bits))
+            kernel_add_name = f"rvv_add_{n_elems}{dt[0]}{dt.bits}"
+            kernel_concat_name = f"rvv_copy_{n_elems}{dt[0]}{dt.bits}"
+            kernel_neg_name = f"rvv_neg_{n_elems}{dt[0]}{dt.bits}"
+            for k in (kernel_add_name, kernel_concat_name, kernel_neg_name):
+                kernels_inventory[k] = n_elems
+
+            if not inventory_only:
+                for kernel_name, kernel_fn in [
+                    (kernel_add_name, rvv_add_kernel),
+                    (kernel_concat_name, rvv_copy_kernel),
+                    (kernel_neg_name, rvv_neg_kernel),
+                ]:
+                    logger.debug(f"Registering kernel {kernel_name}")
+                    desc, impl = kernel_fn(n_elems, dtype, lmul)
+                    TensorIntrin.register(kernel_name, desc, impl, override=True)
+
+            n_elems //= 2
+
+    # ── Polynomial Approximation Kernels ────────────────────────────────────────────────────────
+    # These kernels work only on float values and are polynomial approximations implemented fully RVV
+    #TODO: float16 causes a SEGFAULT on LLVM, needs further research
+    dtypes = ["float32", "float64"]
+    for dtype in dtypes:
+        dt = DataType(dtype)
+        max_elems = get_max_elems(vlen, lmul=8, sew=dt.bits)
+
+        n_elems = max_elems
+        while n_elems >= 4:
+            # size LMUL to the tile so the register group matches n_elems
+            lmul = max(1, n_elems // (vlen // dt.bits))
+            kernel_sigmoid_name = f"rvv_sigmoid_{n_elems}{dt[0]}{dt.bits}"
+            kernel_log_name = f"rvv_log_{n_elems}{dt[0]}{dt.bits}"
+            kernel_exp_name = f"rvv_exp_{n_elems}{dt[0]}{dt.bits}"
+            for k in (kernel_sigmoid_name, kernel_log_name, kernel_exp_name):
+                kernels_inventory[k] = n_elems
+
+            if not inventory_only:
+                for kernel_name, kernel_fn in [
+                    (kernel_sigmoid_name, rvv_sigmoid_kernel),
+                    (kernel_log_name, rvv_log_kernel),
+                    (kernel_exp_name, rvv_exp_kernel),
+                ]:
+                    logger.debug(f"Registering kernel {kernel_name}")
+                    desc, impl = kernel_fn(n_elems, dtype, lmul)
+                    TensorIntrin.register(kernel_name, desc, impl, override=True)
 
             n_elems //= 2
 

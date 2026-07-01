@@ -97,6 +97,7 @@ from .lower_gpu_ipc_alloc_storage import LowerGPUIPCAllocStorage
 from .optimize_layout_transform import OptimizeLayoutTransform
 from .fold_batch_norm_to_conv2d_for_inference import FoldBatchnormToConv2D
 from .remove_redundant_reshape import RemoveRedundantReshape
+from .concat_to_copy import ConcatToCopy
 
 # Import to register the legalization functions.
 from . import legalize_ops
