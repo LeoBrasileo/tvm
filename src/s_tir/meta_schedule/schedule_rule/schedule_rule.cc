@@ -42,6 +42,8 @@ ScheduleRule PyScheduleRuleNode::Clone() const {
   return f_clone();
 }
 
+ffi::Function logger;
+
 ScheduleRule ScheduleRule::PyScheduleRule(
     PyScheduleRuleNode::FInitializeWithTuneContext f_initialize_with_tune_context,  //
     PyScheduleRuleNode::FApply f_apply,                                             //
@@ -329,6 +331,7 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
       // on demand intrinsic register
       reg_rvv_intrinsics(current_target, /* inventory_only */ false);
     }
+    TVM_PY_LOG(INFO, logger) << "Kernel name " << intrin.first;
     rules.push_back(ScheduleRule::MultiLevelTilingWithIntrin(
         /*intrin_name=*/intrin.first,
         /*structure=*/"SSRSRS",
@@ -357,6 +360,11 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
       /*unroll_max_steps=*/ffi::Array<int64_t>{0, 16, 64, 512},
       /*unroll_explicit=*/true));
   rules.push_back(ScheduleRule::RandomComputeLocation());
+
+  const auto reg_rvv_spatial_intrinsics =
+      tvm::ffi::Function::GetGlobalRequired("tirx.tensor_intrin.register_rvv_isa_spatial_intrinsics");
+  const auto rvv_spatial_kernels_inventory = reg_rvv_spatial_intrinsics(current_target, /* inventory_only */ true)
+                                         .cast<ffi::Map<ffi::String, int>>();
 
   return rules;
 }

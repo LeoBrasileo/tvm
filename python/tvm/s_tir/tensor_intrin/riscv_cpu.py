@@ -457,6 +457,26 @@ def register_rvv_isa_intrinsics(target: Target, inventory_only=False) -> dict():
 
             n_elems //= 2
 
+    return kernels_inventory
+
+@tvm_ffi.register_global_func("tirx.tensor_intrin.register_rvv_isa_spatial_intrinsics")
+def register_rvv_isa_spatial_intrinsics(target: Target, inventory_only=False) -> dict():
+    """Register RISCV V (vector) Spatial intrinsics.
+    These include classic one buffer kernels and polynomial approximations
+
+    Args:
+        target (Target): TVM target
+        inventory_only (bool): No registration inventory only
+
+    Returns:
+        dict(): A catalog with registered kernel names and properties
+    """
+    if not target_has_features("v", target):
+        raise RuntimeError("Current target does not support `v` extension.")
+
+    vlen = llvm_get_vector_width(target)
+    kernels_inventory = {}
+
     # ── Spatial Kernels ────────────────────────────────────────────────────────
     dtypes = ["uint8", "uint16", "uint32", "uint64",
               "int8", "int16", "int32", "int64",
@@ -529,4 +549,5 @@ def register_riscv_intrinsics(target: Target):
 
     # RISCV `v` 1.0 extension templates
     _ = register_rvv_isa_intrinsics(target)
+    _ = register_rvv_isa_spatial_intrinsics(target)
     logger.debug("Finished registering riscv intrinsics.")
