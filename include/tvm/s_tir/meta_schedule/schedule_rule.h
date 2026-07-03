@@ -186,6 +186,25 @@ class ScheduleRule : public ffi::ObjectRef {
       ffi::Optional<ffi::Map<ffi::String, ffi::Any>> reuse_read,
       ffi::Optional<ffi::Map<ffi::String, ffi::Any>> reuse_write);
 
+
+  /*!
+   * \brief Tensorization rule for blocks that have NO reduction axis .
+   * \param intrin_name The name of a tensor intrinsic describing a purely spatial computation,
+   * must be registered via TensorIntrin.register(...) beforehand.
+   * \param structure The tiling structure. Should contain only 'S' levels, e.g. "SSS". Any 'R'
+   * in the structure is rejected at construction time since there is no reduction axis to place.
+   * \param max_innermost_factor The maximum size of the innermost factor. std::nullopt means no
+   * limit.
+   * \param reuse_read Data reuse configuration for reading. std::nullopt means no reuse.
+   * \param reuse_write Data reuse configuration for writing. std::nullopt means no reuse.
+   * \return The schedule rule created
+   */
+  TVM_DLL static ScheduleRule SpatialTilingWithIntrin(
+      ffi::String intrin_name, ffi::String structure,
+      ffi::Optional<int64_t> max_innermost_factor,
+      ffi::Optional<ffi::Map<ffi::String, ffi::Any>> reuse_read,
+      ffi::Optional<ffi::Map<ffi::String, ffi::Any>> reuse_write);
+
   /*!
    * \brief Extension of MultiLevelTiling for auto-tensorization with multiple groups of candidate
    * tensor core intrinsics
