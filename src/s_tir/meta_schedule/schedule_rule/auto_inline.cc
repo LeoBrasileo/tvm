@@ -136,11 +136,11 @@ inline InlineType AutoInlineNode::CheckInline(const s_tir::Schedule& sch,
     }
   }
   // Cond 3. The block doesn't contain any disallowed operators
-  if (!is_pure_sptial && !disallow_op.empty() && HasOp(realize, disallow_op)) {
+  if (/*!is_pure_sptial &&*/ !disallow_op.empty() && HasOp(realize, disallow_op)) {
     return InlineType::kNoInline;
   }
   // Cond 4. The block doesn't have any if-then-else-like constructs
-  if (!is_pure_sptial && disallow_if_then_else && HasIfThenElse(realize)) {
+  if (/*!is_pure_sptial &&*/ disallow_if_then_else && HasIfThenElse(realize)) {
     return InlineType::kNoInline;
   }
   // Cond 5. The mapping from read indices to write indices are injective and ordered

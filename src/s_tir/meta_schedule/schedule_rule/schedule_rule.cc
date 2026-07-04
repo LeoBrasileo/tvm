@@ -317,7 +317,7 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
       /*disallow_if_then_else=*/true,
       /*require_injective=*/true,
       /*require_ordered=*/true,
-      /*disallow_op=*/ffi::Array<ffi::String>{"tirx.exp"}));
+      /*disallow_op=*/ffi::Array<ffi::String>{"tirx.exp", "tirx.sigmoid", "tirx.log", "tirx.tanh"}));
   rules.push_back(ScheduleRule::AddRFactor(
       /*max_jobs_per_core=*/16,
       /*max_innermost_factor=*/static_cast<int64_t>(64)));
