@@ -83,17 +83,17 @@ def rvv_vec_dot_product_kernels(
     @T.prim_func(s_tir=True)
     def rvv_vec_dot_prod_desc(
         A: T.Buffer((n_elems,), data_dtype, offset_factor=1),
-        B: T.Buffer((n_lanes, n_elems), weight_dtype, offset_factor=1),
+        B: T.Buffer((n_elems, n_lanes), weight_dtype, offset_factor=1),
         C: T.Buffer((n_lanes,), out_dtype, offset_factor=1),
     ) -> None:
         with T.sblock("root"):
-            T.reads(C[0:n_lanes], A[0:n_elems], B[0:n_lanes, 0:n_elems])
+            T.reads(C[0:n_lanes], A[0:n_elems], B[0:n_elems, 0:n_lanes])
             T.writes(C[0:n_lanes])
             for j in T.serial(0, n_lanes):
                 for k in T.serial(0, n_elems):
                     with T.sblock("update"):
                         vj, vk = T.axis.remap("SR", [j, k])
-                        C[vj] = C[vj] + T.cast(A[vk], out_dtype) * T.cast(B[vj, vk], out_dtype)
+                        C[vj] = C[vj] + T.cast(A[vk], out_dtype) * T.cast(B[vk, vj], out_dtype)
 
     # LLVM only supports ELEN=32 or ELEN=64
     # https://llvm.org/docs//RISCV/RISCVVectorExtension.html
@@ -113,11 +113,11 @@ def rvv_vec_dot_product_kernels(
     @T.prim_func(s_tir=True)
     def rvv_vec_dot_prod_impl(
         A: T.Buffer((n_elems,), data_dtype, offset_factor=1),
-        B: T.Buffer((n_lanes, n_elems), weight_dtype, offset_factor=1),
+        B: T.Buffer((n_elems, n_lanes), weight_dtype, offset_factor=1, strides=[T.int32(), 1]),
         C: T.Buffer((n_lanes,), out_dtype, offset_factor=1),
     ) -> None:
         with T.sblock("root"):
-            T.reads(C[0:n_lanes], A[0:n_elems], B[0:n_lanes, 0:n_elems])
+            T.reads(C[0:n_lanes], A[0:n_elems], B[0:n_elems, 0:n_lanes])
             T.writes(C[0:n_lanes])
 
             vec_A = T.call_llvm_intrin(
@@ -129,14 +129,15 @@ def rvv_vec_dot_product_kernels(
 
             for i in range(n_lanes):
                 with T.sblock("update"):
-                    T.reads(B[i, 0:n_elems])
+                    T.reads(B[0:n_elems, i])
                     T.writes(C[i])
 
                     vec_B_row = T.call_llvm_intrin(
                         f"{weight_dtype}xvscalex{w_dtype_lanes}",
-                        "llvm.riscv.vle",
-                        T.broadcast(T.Cast(data_dtype, 0), T.vscale() * w_dtype_lanes),
-                        T.tvm_access_ptr(T.type_annotation(weight_dtype), B.data, i * n_elems, n_elems, 1),
+                        "llvm.riscv.vlse",
+                        T.broadcast(T.Cast(weight_dtype, 0), T.vscale() * w_dtype_lanes),
+                        T.tvm_access_ptr(T.type_annotation(weight_dtype), B.data, i, n_elems * B.strides[0], 1),
+                        T.Cast("int64", B.strides[0] * (DataType(weight_dtype).bits // 8)),
                         T.int64(n_elems))
 
                     product = T.call_llvm_intrin(
