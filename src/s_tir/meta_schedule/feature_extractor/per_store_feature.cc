@@ -57,6 +57,22 @@ inline double slog(double x) { return x >= 0 ? std::log2(x + 1) : std::log2(-x +
 namespace utils {
 
 /*!
+ * \brief Storage bytes for one value of a dtype.
+ *
+ * RVV tensor intrinsics introduce register-level temporaries whose buffer dtype
+ * is a scalable vector (e.g. `float32xvscalex8`).
+ * \param dtype The dtype to size
+ * \return The number of bytes for one value of the dtype
+ */
+inline int64_t StorageBytes(const PrimType& dtype) {
+  if (dtype.IsScalableVector()) {
+    int64_t min_lanes = dtype.VScaleFactor();
+    return (static_cast<int64_t>(dtype.bits()) * min_lanes + 7) / 8;
+  }
+  return static_cast<int64_t>(dtype.StorageBytes());
+}
+
+/*!
  * \brief Get the shape of the buffer
  * \param buffer The buffer
  * \param analyzer The analyzer
@@ -852,7 +868,7 @@ void Feature::SetRegion(const LoopNest& loop_nest, IntVec* for_touched_bytes,
       feature.access_shape = utils::RelaxAndUnion(feature.multi_indices, &numel, analyzer);
       numel = std::max<int64_t>(0, numel);
       feature.loop_accessed_numel[i][buffer] = numel;
-      touched_bytes += numel * static_cast<int64_t>(buffer->dtype.StorageBytes());
+      touched_bytes += numel * utils::StorageBytes(buffer->dtype);
       (*buffer_touched_under_loop)[loop][buffer].push_back(numel);
     }
   }
@@ -880,7 +896,7 @@ void Feature::SubFeature::SetStride(const LoopNest& loop_nest, arith::AnalyzerOb
     TVM_FFI_ICHECK_EQ(access_shape.size(), buffer_shape.size());
     for (int i = ndim - 1; i >= 0; --i) {
       if (access_shape[i] == buffer_shape[i]) {
-        num_continuous_bytes = buffer_shape[i] * static_cast<int64_t>(buffer->dtype.StorageBytes());
+        num_continuous_bytes = buffer_shape[i] * utils::StorageBytes(buffer->dtype);
         break;
       }
     }
@@ -953,7 +969,7 @@ void Feature::SubFeature::SetReuse(const LoopNest& loop_nest, int64_t top_loop_t
           const BufferNode* buffer = iter.first;
           const IntVec& numels = iter.second;
           int64_t numel = std::accumulate(numels.begin(), numels.end(), int64_t(0));
-          reuse_dis_bytes += numel * static_cast<int64_t>(buffer->dtype.StorageBytes());
+          reuse_dis_bytes += numel * utils::StorageBytes(buffer->dtype);
         }
       }
       break;
@@ -973,7 +989,7 @@ void Feature::SubFeature::SetReuse(const LoopNest& loop_nest, int64_t top_loop_t
         const BufferNode* buffer = iter.first;
         const IntVec& numels = iter.second;
         int64_t numel = std::accumulate(numels.begin(), numels.end(), int64_t(0));
-        reuse_dis_bytes += numel * static_cast<int64_t>(buffer->dtype.StorageBytes());
+        reuse_dis_bytes += numel * utils::StorageBytes(buffer->dtype);
       }
       reuse_dis_iter /= extent;
       reuse_dis_bytes /= extent;
@@ -983,7 +999,7 @@ void Feature::SubFeature::SetReuse(const LoopNest& loop_nest, int64_t top_loop_t
 }
 
 void Feature::SubFeature::SetFeature(const LoopNest& loop_nest, int64_t cache_line_bytes) {
-  int64_t dtype_bytes = static_cast<int64_t>(this->buffer->dtype.StorageBytes());
+  int64_t dtype_bytes = utils::StorageBytes(this->buffer->dtype);
   this->stride = this->innermost_stride;
   this->bytes = dtype_bytes * loop_nest.prod;
   if (loop_nest.loops.empty()) {
@@ -1023,7 +1039,7 @@ Feature::Feature(const BufferStoreNode* store, const LoopNest& loop_nest, int64_
   int64_t top_loop_touch_bytes = 0.0;
   if (n_loops > 0) {
     for (const SubFeature& feature : sub_features) {
-      int64_t bytes = static_cast<int64_t>(feature.buffer->dtype.StorageBytes());
+      int64_t bytes = utils::StorageBytes(feature.buffer->dtype);
       int64_t n_buffer = feature.loop_accessed_numel[0].size();
       top_loop_touch_bytes += bytes * n_buffer;
     }
@@ -1161,7 +1177,7 @@ struct Feature {
     for (int64_t x : shape) {
       numel *= x;
     }
-    alloc_size = numel * static_cast<int64_t>(buffer->dtype.StorageBytes());
+    alloc_size = numel * utils::StorageBytes(buffer->dtype);
     alloc_prod = numel * loop_nest.prod;
     alloc_outer_prod = loop_nest.prod;
   }

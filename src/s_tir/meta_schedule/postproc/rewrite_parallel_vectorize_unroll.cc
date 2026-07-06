@@ -19,6 +19,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/stmt.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include "../utils.h"
 
@@ -33,6 +34,37 @@ using namespace tvm::tirx;
  */
 inline bool HasAnnOrBinding(const ForNode* loop) {
   return loop->kind == ForKind::kThreadBinding || !loop->annotations.empty();
+}
+
+/*!
+ * \brief Whether a loop body must not be wrapped in a vectorized loop because
+ *        it produces scalable vectors.
+ *
+ * Two cases, both of which make ``VectorizeLoop`` reject the loop at codegen
+ * with "vectorizing over existing scalable vectors":
+ *  1. The body already contains scalable-vector ``<vscale x N>``.
+ *  2. The body contains a block still carrying a non-empty ``meta_schedule.auto_tensorize`` annotation.
+ * \param stmt The loop body to inspect
+ * \return Whether the loop must be left un-vectorized
+ */
+inline bool ContainsScalableVector(const Stmt& stmt) {
+  bool found = false;
+  tirx::PostOrderVisit(stmt, [&found](const ffi::ObjectRef& obj) {
+    if (found) {
+      return;
+    }
+    if (const auto* ramp = obj.as<RampNode>()) {
+      found = !ramp->lanes->IsInstance<IntImmNode>();
+    } else if (const auto* broadcast = obj.as<BroadcastNode>()) {
+      found = !broadcast->lanes->IsInstance<IntImmNode>();
+    } else if (const auto* block = obj.as<SBlockNode>()) {
+      if (ffi::Optional<ffi::String> intrin =
+              GetAnn<ffi::String>(block, s_tir::attr::meta_schedule_auto_tensorize)) {
+        found = intrin.value() != "";
+      }
+    }
+  });
+  return found;
 }
 
 /*! \brief The visitor for extracting the stride of a var in a PrimExpr. */
@@ -316,6 +348,10 @@ void AdjustParallelVectorize(const Schedule& sch, const SBlockRV& block_rv,
       const StmtSRef& loop_sref = loop_srefs[i];
       const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
       if (HasAnnOrBinding(loop)) {
+        break;
+      }
+      // Cannot vectorize a loop whose body already produces scalable vectors
+      if (ContainsScalableVector(loop->body)) {
         break;
       }
       // Cannot vectorize reduce axis
