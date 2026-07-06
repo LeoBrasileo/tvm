@@ -17,6 +17,7 @@
 """TVM Script Parser utils"""
 
 import inspect
+import linecache
 from collections.abc import Callable
 from types import FrameType
 from typing import Any
@@ -171,6 +172,16 @@ def resolve_closure_vars(
                         break
 
 
+def _frame_source_line(frame_info) -> str | None:
+    """Return the source line at *frame_info*'s current position.
+    """
+    code_context = frame_info.code_context
+    if code_context:
+        return code_context[0]
+    line = linecache.getline(frame_info.filename, frame_info.lineno)
+    return line or None
+
+
 def is_defined_in_class(frames: list[FrameType], obj: Any) -> bool:
     """Check whether a object is defined in a class scope.
 
@@ -196,10 +207,10 @@ def is_defined_in_class(frames: list[FrameType], obj: Any) -> bool:
 
     if len(frames) > 2:
         frame_info = frames[2]
-        code_context = frame_info.code_context
-        if code_context is None:
+        source_line = _frame_source_line(frame_info)
+        if source_line is None:
             return False
-        line = code_context[0].strip()
+        line = source_line.strip()
         if _is_tvmscript_class_annotator(line):
             return True
         if line.startswith("class"):

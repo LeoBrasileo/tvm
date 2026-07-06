@@ -59,8 +59,10 @@ def prim_func(
     # (private will be used in the parser, but not immediately)
 
     # need to capture this var outside the wrapper because the wrapper
-    # adds to the stack
-    outer_stack = inspect.stack()
+    # adds to the stack.
+    # use context=0 so inspect does not read source context for every
+    # frame.
+    outer_stack = inspect.stack(0)
 
     def decorator_wrapper(func):
         if not inspect.isfunction(func):
