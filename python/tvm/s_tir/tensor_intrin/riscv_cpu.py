@@ -124,7 +124,7 @@ def rvv_vec_dot_product_kernels(
                 f"{data_dtype}xvscalex{d_dtype_lanes}",
                 "llvm.riscv.vle",
                 T.broadcast(T.Cast(data_dtype, 0), T.vscale() * d_dtype_lanes),
-                T.tvm_access_ptr(T.type_annotation(data_dtype), A.data, 0, n_elems, 1),
+                T.tvm_access_ptr(T.type_annotation(data_dtype), A.data, A.elem_offset, n_elems, 1),
                 T.int64(n_elems))
 
             for i in range(n_lanes):
@@ -136,7 +136,7 @@ def rvv_vec_dot_product_kernels(
                         f"{weight_dtype}xvscalex{w_dtype_lanes}",
                         "llvm.riscv.vlse",
                         T.broadcast(T.Cast(weight_dtype, 0), T.vscale() * w_dtype_lanes),
-                        T.tvm_access_ptr(T.type_annotation(weight_dtype), B.data, i, n_elems * B.strides[0], 1),
+                        T.tvm_access_ptr(T.type_annotation(weight_dtype), B.data, B.elem_offset + i, n_elems * B.strides[0], 1),
                         T.Cast("int64", B.strides[0] * (DataType(weight_dtype).bits // 8)),
                         T.int64(n_elems))
 
@@ -155,7 +155,7 @@ def rvv_vec_dot_product_kernels(
                         f"{out_dtype}xvscalex{o_dtype_lanes}",
                         "llvm.riscv.vle",
                         T.broadcast(T.Cast(out_dtype, 0), T.vscale() * o_dtype_lanes),
-                        T.tvm_access_ptr(T.type_annotation(out_dtype), C.data, i, 1, 1),
+                        T.tvm_access_ptr(T.type_annotation(out_dtype), C.data, C.elem_offset + i, 1, 1),
                         T.int64(1))
 
                     red_sum = T.call_llvm_intrin(
