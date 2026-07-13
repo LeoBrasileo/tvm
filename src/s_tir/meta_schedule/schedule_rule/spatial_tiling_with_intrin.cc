@@ -82,6 +82,7 @@ class SpatialTilingWithIntrinNode : public MultiLevelTilingNode {
     }
 
     ffi::Array<s_tir::Schedule> results;
+    results.push_back(sch);
     for (auto&& state : states) {
       results.push_back(std::move(state->sch));
     }
