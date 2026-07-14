@@ -181,7 +181,17 @@ inline InlineType AutoInlineNode::CheckInline(const s_tir::Schedule& sch,
   if (into_consumer) {
     ffi::Array<tirx::StmtSRef> consumer_srefs = GetConsumers(state, block_sref);
     if (!consumer_srefs.empty() && CanComputeInline(state, block_sref)) {
-      return InlineType::kInlineIntoConsumer;
+      bool consumer_slated_for_tensorize = false;
+      for (const tirx::StmtSRef& consumer_sref : consumer_srefs) {
+        if (GetAnn<ffi::String>(consumer_sref, s_tir::attr::meta_schedule_auto_tensorize)
+                .has_value()) {
+          consumer_slated_for_tensorize = true;
+          break;
+                }
+      }
+      if (!consumer_slated_for_tensorize) {
+        return InlineType::kInlineIntoConsumer;
+      }
     }
   }
   if (into_producer) {

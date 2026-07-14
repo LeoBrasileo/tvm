@@ -310,14 +310,6 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
   ffi::Array<ScheduleRule> rules;
   rules.push_back(ScheduleRule::ApplyCustomRule());
   rules.push_back(ScheduleRule::InlineConstantScalars());
-  rules.push_back(ScheduleRule::AutoInline(
-      /*into_producer=*/false,
-      /*into_consumer=*/true,
-      /*inline_const_tensor=*/true,
-      /*disallow_if_then_else=*/true,
-      /*require_injective=*/true,
-      /*require_ordered=*/true,
-      /*disallow_op=*/ffi::Array<ffi::String>{"tirx.exp", "tirx.sigmoid", "tirx.log", "tirx.tanh"}));
   rules.push_back(ScheduleRule::AddRFactor(
       /*max_jobs_per_core=*/16,
       /*max_innermost_factor=*/static_cast<int64_t>(64)));
@@ -344,6 +336,16 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
                                         {"levels", ffi::Array<int64_t>{1, 2}},
                                         {"scope", ffi::String("global")}}));
   }
+
+  // Do Inlining after tensorizing available spatial operators so we don't mess with possible tensorized speedup spaces
+  rules.push_back(ScheduleRule::AutoInline(
+      /*into_producer=*/false,
+      /*into_consumer=*/true,
+      /*inline_const_tensor=*/true,
+      /*disallow_if_then_else=*/true,
+      /*require_injective=*/true,
+      /*require_ordered=*/true,
+      /*disallow_op=*/ffi::Array<ffi::String>{"tirx.exp", "tirx.sigmoid", "tirx.log", "tirx.tanh"}));
 
   // multilevel intrinsic kernels used specifically for matmul operations
   const auto reg_rvv_intrinsics =

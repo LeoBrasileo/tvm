@@ -1151,7 +1151,19 @@ struct BufferVarInfo {
   // shuffled for scalar reads when rewrite_scalar_read_to_vector_shuffle is enabled.
   std::unordered_set<PrimType, PrimTypeHash, PrimTypeEqual> scalar_read_dtype;
 
+  /* Whether the buffer is accessed anywhere with a scalable vector type.
+   *
+   * VectorTypeRewriter cannot rewrite scalable accesses, so such a buffer must keep its
+   * declared element type.  Otherwise the allocation would be rewritten to a vectorized
+   * element type while the scalable accesses still refer to the original buffer var,
+   * leaving that var undefined.
+   */
+  bool has_scalable_access{false};
+
   PrimType get_preferred_dtype() const {
+    if (has_scalable_access) {
+      return element_dtype;
+    }
     std::unordered_set<PrimType, PrimTypeHash, PrimTypeEqual> base_access_dtype;
     for (auto dtype : access_dtype) {
       base_access_dtype.insert(dtype.WithLanes(1));
@@ -1345,13 +1357,14 @@ class VectorTypeAccessChecker : public StmtExprVisitor {
     TVM_FFI_ICHECK(it != info_map_.end()) << "Load/Store of buffer " << buffer->name_hint << " ("
                                           << buffer << ") occurred before its declaration.";
 
-    if (value_dtype.IsScalableVector()) {
-      // Scalable types are not currently supported in storage_rewrite. Scalable buffer
-      // accesses are not currently checked and therefore are not rewritten.
+    BufferVarInfo& var_info = it->second;
+
+    if (value_dtype.IsScalableVector() ||
+        (indices.size() && indices.back().ty().IsScalableVector())) {
+      // Scalable types are not currently supported in storage_rewrite, so VectorTypeRewriter leaves these accesses referring to the original buffer var.
+      var_info.has_scalable_access = true;
       return;
     }
-
-    BufferVarInfo& var_info = it->second;
 
     if (value_dtype.WithLanes(1).MatchesCode(DLDataTypeCode::kDLBool)) {
       value_dtype = PrimType::Int(8, value_dtype.lanes());
