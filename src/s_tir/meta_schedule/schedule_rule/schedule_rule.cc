@@ -324,6 +324,11 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
     if (!tirx::TensorIntrin::Get(intrin.first, /*allow_missing*/ true)) {
       reg_rvv_spatial_intrinsics(current_target, /* inventory_only */ false);
     }
+    const std::string kernel_name(intrin.first);
+    if (kernel_name.rfind("rvv_add_relu_", 0) == 0) {
+      // Skip add_relu kernels; not handled by this rule set
+      continue;
+    }
     TVM_PY_LOG(INFO, logger) << "Spatial kernel name " << intrin.first
                                   << " tile: " << intrin.second;
     rules.push_back(ScheduleRule::SpatialTilingWithIntrin(
@@ -346,6 +351,23 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
       /*require_injective=*/true,
       /*require_ordered=*/true,
       /*disallow_op=*/ffi::Array<ffi::String>{"tirx.exp", "tirx.sigmoid", "tirx.log", "tirx.tanh"}));
+
+  // Search for add_relus after inlining
+  for (const auto& intrin : rvv_spatial_kernels_inventory) {
+    const std::string kernel_name(intrin.first);
+    if (kernel_name.rfind("rvv_add_relu_", 0) != 0) {
+      continue;
+    }
+    rules.push_back(ScheduleRule::SpatialTilingWithIntrin(
+        /*intrin_name=*/intrin.first,
+        /*structure=*/"SSSS",
+        /*max_innermost_factor=*/static_cast<int64_t>(intrin.second),
+        /*reuse_read=*/std::nullopt,
+        /*reuse_write=*/
+        ffi::Map<ffi::String, ffi::Any>{{"req", ffi::String("may")},
+                                        {"levels", ffi::Array<int64_t>{1, 2}},
+                                        {"scope", ffi::String("global")}}));
+  }
 
   // multilevel intrinsic kernels used specifically for matmul operations
   const auto reg_rvv_intrinsics =

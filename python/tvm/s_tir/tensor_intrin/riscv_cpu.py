@@ -238,7 +238,6 @@ def rvv_add_kernel(
                 T.tvm_access_ptr(T.type_annotation(dtype), A.data, A.elem_offset, n_elems, READ),
                 T.int64(n_elems),
             )
-
             vec_B = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vle",
@@ -266,6 +265,158 @@ def rvv_add_kernel(
             )
     # fmt: on
     return rvv_add_desc, rvv_add_impl
+
+
+def rvv_copy_kernel(n_elems: int, dtype: str, lmul: int):
+    """Implementation of a plain scalar copy loop over n_elems elements
+    for concatenating using RISC-V vector instructions.
+
+    The descriptor is a plain scalar copy loop over n_elems elements.
+    The implementation replaces it with a single vle + vse pair.
+    Two-buffer signature (A -> C).
+    """
+    dt = DataType(dtype)
+    dtype_lanes = max((64 // dt.bits) * lmul, 2)
+    vec_dtype = f"{dtype}xvscalex{dtype_lanes}"
+
+    @T.prim_func(s_tir=True)
+    def rvv_copy_desc(
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((n_elems,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems])
+            T.writes(C[0:n_elems])
+            for i in T.serial(0, n_elems):
+                with T.sblock("update"):
+                    vi = T.axis.remap("S", [i])
+                    C[vi] = A[vi]
+
+    # fmt: off
+    @T.prim_func(s_tir=True)
+    def rvv_copy_impl(
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((n_elems,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems])
+            T.writes(C[0:n_elems])
+
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vle",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                T.tvm_access_ptr(T.type_annotation(dtype), A.data, A.elem_offset, n_elems, READ),
+                T.int64(n_elems),
+            )
+            T.call_llvm_intrin(
+                "void",
+                "llvm.riscv.vse",
+                vec_A,
+                T.tvm_access_ptr(T.type_annotation(dtype), C.data, C.elem_offset, n_elems, WRITE),
+                T.int64(n_elems),
+            )
+
+    # fmt: on
+
+    return rvv_copy_desc, rvv_copy_impl
+
+
+def rvv_add_relu_kernel(
+        n_elems: int,
+        dtype: str,
+        lmul: int,
+):
+    """Element-wise vector add using RISC-V vector instructions.
+
+    Computes C[n_elems] = Max(A[n_elems] + B[n_elems], 0) using explicit LLVM RVV intrinsics
+
+    Args:
+        n_elems (int): Number of elements (must fit in lmul vector registers)
+        dtype   (str): Element dtype, e.g. "float32", "int32"
+        lmul    (int): LMUL register group multiplier
+    """
+    dt = DataType(dtype)
+    # TVM cannot encode `vscale * 1` (it folds to a bare vscale),
+    # so the min-lane count must stay >= 2.
+    dtype_lanes = max((64 // dt.bits) * lmul, 2)
+
+    vec_dtype = f"{dtype}xvscalex{dtype_lanes}"
+
+    # Select intrinsic: vfadd for float, vadd for integer
+    is_float = dtype.startswith("float")
+    add_intrin = "llvm.riscv.vfadd" if is_float else "llvm.riscv.vadd"
+
+    # ── descriptor ────────────────────────────────────────────────────────────
+    @T.prim_func(s_tir=True)
+    def rvv_add_relu_desc(
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            B: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((n_elems,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems], B[0:n_elems])
+            T.writes(C[0:n_elems])
+            for i in T.serial(0, n_elems):
+                with T.sblock("update"):
+                    vi = T.axis.remap("S", [i])
+                    C[vi] = T.max(A[vi] + B[vi], 0)
+
+    # ── implementation ────────────────────────────────────────────────────────
+    # fmt: off
+    @T.prim_func(s_tir=True)
+    def rvv_add_relu_impl(
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            B: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((n_elems,), dtype, offset_factor=1),
+    ) -> None:
+        with T.sblock("root"):
+            T.reads(A[0:n_elems], B[0:n_elems])
+            T.writes(C[0:n_elems])
+
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vle",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                T.tvm_access_ptr(T.type_annotation(dtype), A.data, A.elem_offset, n_elems, READ),
+                T.int64(n_elems),
+            )
+            vec_B = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vle",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                T.tvm_access_ptr(T.type_annotation(dtype), B.data, B.elem_offset, n_elems, READ),
+                T.int64(n_elems),
+            )
+
+            vec_C = T.call_llvm_intrin(
+                vec_dtype,
+                add_intrin,
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                vec_A,
+                vec_B,
+                *mask_llvm(dtype),
+                T.int64(n_elems),
+            )
+
+            vec_relu = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmax" if is_float else "llvm.riscv.vmax",
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                vec_C,
+                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                T.int64(n_elems),
+            )
+
+            T.call_llvm_intrin(
+                "void",
+                "llvm.riscv.vse",
+                vec_relu,
+                T.tvm_access_ptr(T.type_annotation(dtype), C.data, C.elem_offset, n_elems, WRITE),
+                T.int64(n_elems),
+            )
+    # fmt: on
+    return rvv_add_relu_desc, rvv_add_relu_impl
 
 
 def rvv_copy_kernel(n_elems: int, dtype: str, lmul: int):
@@ -479,9 +630,9 @@ def register_rvv_isa_spatial_intrinsics(target: Target, inventory_only=False) ->
     kernels_inventory = {}
 
     # ── Spatial Kernels ────────────────────────────────────────────────────────
-    dtypes = ["uint8", "uint16", "uint32", "uint64",
-              "int8", "int16", "int32", "int64",
-              "float16", "float32", "float64"]
+    dtypes = [#"uint8", "uint16", "uint32", "uint64",
+              #"int8", "int32", "int64", #"int16", "float16",
+              "float32", "float64"]
     for dtype in dtypes:
         dt = DataType(dtype)
         max_elems = get_max_elems(vlen, lmul=8, sew=dt.bits)
@@ -491,15 +642,17 @@ def register_rvv_isa_spatial_intrinsics(target: Target, inventory_only=False) ->
             # size LMUL to the tile so the register group matches n_elems
             lmul = max(1, n_elems // (vlen // dt.bits))
             kernel_add_name = f"rvv_add_{n_elems}{dt[0]}{dt.bits}"
-            kernel_concat_name = f"rvv_copy_{n_elems}{dt[0]}{dt.bits}"
+            kernel_add_relu_name = f"rvv_add_relu_{n_elems}{dt[0]}{dt.bits}"
+            #kernel_concat_name = f"rvv_copy_{n_elems}{dt[0]}{dt.bits}"
             kernel_neg_name = f"rvv_neg_{n_elems}{dt[0]}{dt.bits}"
-            for k in (kernel_add_name, kernel_concat_name, kernel_neg_name):
+            for k in (kernel_add_relu_name, kernel_add_name, kernel_neg_name):
                 kernels_inventory[k] = n_elems
 
             if not inventory_only:
                 for kernel_name, kernel_fn in [
+                    (kernel_add_relu_name, rvv_add_relu_kernel),
                     (kernel_add_name, rvv_add_kernel),
-                    (kernel_concat_name, rvv_copy_kernel),
+                    #(kernel_concat_name, rvv_copy_kernel),
                     (kernel_neg_name, rvv_neg_kernel),
                 ]:
                     logger.debug(f"Registering kernel {kernel_name}")
