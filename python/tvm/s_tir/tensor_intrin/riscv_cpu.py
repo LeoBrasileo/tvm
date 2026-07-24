@@ -27,7 +27,7 @@ from tvm.script import tirx as T
 from tvm.target.codegen import Target, llvm_get_vector_width, target_has_features
 
 from .. import TensorIntrin
-from .riscv_approximations_cpu import rvv_sigmoid_kernel, rvv_log_kernel, rvv_exp_kernel, rvv_exp_sub_kernel, rvv_tanh_kernel
+from .riscv_approximations_cpu import rvv_sigmoid_kernel, rvv_log_kernel, rvv_exp_kernel, rvv_exp_sub_kernel, rvv_tanh_kernel, rvv_erf_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -678,8 +678,9 @@ def register_rvv_isa_spatial_intrinsics(target: Target, inventory_only=False) ->
             kernel_exp_name = f"rvv_exp_{n_elems}{dt[0]}{dt.bits}"
             kernel_exp_sub_name = f"rvv_exp_sub_{n_elems}{dt[0]}{dt.bits}"
             kernel_tanh_name = f"rvv_tanh_{n_elems}{dt[0]}{dt.bits}"
+            kernel_erf_name = f"rvv_erf_{n_elems}{dt[0]}{dt.bits}"
             for k in (kernel_sigmoid_name, kernel_log_name, kernel_exp_name,
-                      kernel_exp_sub_name, kernel_tanh_name):
+                      kernel_exp_sub_name, kernel_tanh_name, kernel_erf_name):
                 kernels_inventory[k] = n_elems
 
             if not inventory_only:
@@ -689,6 +690,7 @@ def register_rvv_isa_spatial_intrinsics(target: Target, inventory_only=False) ->
                     (kernel_exp_name, rvv_exp_kernel),
                     (kernel_exp_sub_name, rvv_exp_sub_kernel),
                     (kernel_tanh_name, rvv_tanh_kernel),
+                    (kernel_erf_name, rvv_erf_kernel),
                 ]:
                     logger.debug(f"Registering kernel {kernel_name}")
                     desc, impl = kernel_fn(n_elems, dtype, lmul)
