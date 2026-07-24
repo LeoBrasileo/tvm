@@ -102,6 +102,8 @@ class SpatialTilingWithIntrinNode : public MultiLevelTilingNode {
       }
       return std::vector<State>();
     });
+    states = SubRule(std::move(states),
+                     [&](State state) { return TileLoopNest(std::move(state)); });
     return states;
   }
 
