@@ -146,6 +146,26 @@ class RandomEngine {
     // Make the value be 1.0 - 10.0, not (0.0 - 1.0) so that we could satisfy
     // quantized dtype (uint8 / int8) data non-empty requirement
     std::uniform_real_distribution<> dist(1.0, 10.0);
+    if (dtype.code == kDLInt || dtype.code == kDLUInt) {
+      if (dtype.bits == 8) {
+        std::generate_n(static_cast<uint8_t*>(data) + st, ed - st,
+                        [&]() { return static_cast<uint8_t>(dist(rnd_engine_)); });
+      } else if (dtype.bits == 16) {
+        std::generate_n(static_cast<uint16_t*>(data) + st, ed - st,
+                        [&]() { return static_cast<uint16_t>(dist(rnd_engine_)); });
+      } else if (dtype.bits == 32) {
+        std::generate_n(static_cast<uint32_t*>(data) + st, ed - st,
+                        [&]() { return static_cast<uint32_t>(dist(rnd_engine_)); });
+      } else if (dtype.bits == 64) {
+        std::generate_n(static_cast<uint64_t*>(data) + st, ed - st,
+                        [&]() { return static_cast<uint64_t>(dist(rnd_engine_)); });
+      } else {
+        TVM_FFI_THROW(InternalError) << "Doesn't support dtype code "
+                                     << static_cast<int>(dtype.code) << " dtype bits "
+                                     << static_cast<int>(dtype.bits);
+      }
+      return;
+    }
     // Use float representation could make us work well on float / int type too.
     if (dtype.bits == 8) {
       std::generate_n(static_cast<uint8_t*>(data) + st, ed - st,
