@@ -25,6 +25,12 @@ READ, WRITE = 1, 2 #0b01, 0b10
 # float instructions require an explicit rounding mode, use DYN 0b111
 mask_args = (T.uint64(0b111),)
 
+# Clamping the range-reduction argument to the interval below keeps k inside
+# the representable exponent range. This is important because every exp-based kernel reconstructs 2**k by writing the biased exponent
+# (k + bias) into the exponent field
+EXP_ARG_MIN = {16: -9.7, 32: -87.0, 64: -708.0}
+EXP_ARG_MAX = {16: 10.5, 32: 88.0, 64: 709.0}
+
 def rvv_sigmoid_kernel(
         n_elems: int,
         dtype: str,
@@ -83,6 +89,10 @@ def rvv_sigmoid_kernel(
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
     vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), T.vscale() * dtype_lanes)
 
+    # Exponent-safe bounds for the range-reduction argument, see EXP_ARG_MIN
+    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), T.vscale() * dtype_lanes)
+    vec_exp_hi = T.broadcast(getattr(T, dtype)(EXP_ARG_MAX[dt.bits]), T.vscale() * dtype_lanes)
+
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_sigmoid_impl(
@@ -109,6 +119,24 @@ def rvv_sigmoid_kernel(
                 vec_zero,
                 vec_A,
                 *mask_args,
+                T.int64(n_elems),
+            )
+
+            # Keep the argument inside the exponent-safe range, see EXP_ARG_MIN
+            vec_neg_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmax",
+                vec_broadcast,
+                vec_neg_A,
+                vec_exp_lo,
+                T.int64(n_elems),
+            )
+            vec_neg_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmin",
+                vec_broadcast,
+                vec_neg_A,
+                vec_exp_hi,
                 T.int64(n_elems),
             )
 
@@ -683,6 +711,9 @@ def rvv_exp_kernel(
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
     vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), T.vscale() * dtype_lanes)
 
+    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), T.vscale() * dtype_lanes)
+    vec_exp_hi = T.broadcast(getattr(T, dtype)(EXP_ARG_MAX[dt.bits]), T.vscale() * dtype_lanes)
+
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_exp_impl(
@@ -698,6 +729,24 @@ def rvv_exp_kernel(
                 "llvm.riscv.vle",
                 vec_broadcast,
                 T.tvm_access_ptr(T.type_annotation(dtype), A.data, A.elem_offset, n_elems, READ),
+                T.int64(n_elems),
+            )
+
+            # Keep the argument inside the exponent-safe range
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmax",
+                vec_broadcast,
+                vec_A,
+                vec_exp_lo,
+                T.int64(n_elems),
+            )
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmin",
+                vec_broadcast,
+                vec_A,
+                vec_exp_hi,
                 T.int64(n_elems),
             )
 
@@ -917,6 +966,10 @@ def rvv_exp_sub_kernel(
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
     vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), T.vscale() * dtype_lanes)
 
+    # Exponent-safe bounds
+    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), T.vscale() * dtype_lanes)
+    vec_exp_hi = T.broadcast(getattr(T, dtype)(EXP_ARG_MAX[dt.bits]), T.vscale() * dtype_lanes)
+
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_exp_sub_impl(
@@ -952,6 +1005,24 @@ def rvv_exp_sub_kernel(
                 vec_A,
                 vec_S,
                 *mask_args,
+                T.int64(n_elems),
+            )
+
+            # Keep the argument inside the exponent-safe range
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmax",
+                vec_broadcast,
+                vec_A,
+                vec_exp_lo,
+                T.int64(n_elems),
+            )
+            vec_A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmin",
+                vec_broadcast,
+                vec_A,
+                vec_exp_hi,
                 T.int64(n_elems),
             )
 
@@ -1176,6 +1247,9 @@ def rvv_tanh_kernel(
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
     vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), T.vscale() * dtype_lanes)
 
+    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), T.vscale() * dtype_lanes)
+    vec_exp_hi = T.broadcast(getattr(T, dtype)(EXP_ARG_MAX[dt.bits]), T.vscale() * dtype_lanes)
+
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_tanh_impl(
@@ -1201,6 +1275,24 @@ def rvv_tanh_kernel(
                 vec_A,
                 vec_A,
                 *mask_args,
+                T.int64(n_elems),
+            )
+
+            # Keep the argument inside the exponent-safe range
+            vec_2A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmax",
+                vec_broadcast,
+                vec_2A,
+                vec_exp_lo,
+                T.int64(n_elems),
+            )
+            vec_2A = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmin",
+                vec_broadcast,
+                vec_2A,
+                vec_exp_hi,
                 T.int64(n_elems),
             )
 
@@ -1465,6 +1557,9 @@ def rvv_erf_kernel(
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), vlanes)
     vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), vlanes)
 
+    # Exponent-safe bounds for the range-reduction argument, erf only uses lower bound
+    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), vlanes)
+
     # Sign-bit isolation constants for the final copysign(result, A) step —
     # same bit-trick idiom as the mantissa/exponent manipulation in
     # rvv_log_kernel, rather than relying on a `vfsgnj` intrinsic being
@@ -1529,6 +1624,15 @@ def rvv_erf_kernel(
                 vec_zero,
                 vec_x2,
                 *mask_args,
+                T.int64(n_elems),
+            )
+
+            vec_neg_x2 = T.call_llvm_intrin(
+                vec_dtype,
+                "llvm.riscv.vfmax",
+                vec_broadcast,
+                vec_neg_x2,
+                vec_exp_lo,
                 T.int64(n_elems),
             )
 
