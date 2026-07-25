@@ -48,6 +48,8 @@ def _load_builtin_backends() -> None:
     for name in _BUILTIN_BACKENDS:
         load(name)
 
+
+def _load_runtime_extra() -> None:
     runtime_dir = Path(_LOADED_LIBS["tvm_runtime"]._name).resolve().parent
     try:
         # Load libtvm_runtime_extra if available for registration side effects.
@@ -59,7 +61,6 @@ def _load_builtin_backends() -> None:
         )
     except (OSError, FileNotFoundError, RuntimeError):
         pass
-    return None
 
 
 def _autoload_backends() -> None:
@@ -76,6 +77,8 @@ def _autoload_backends() -> None:
 
     if not _RUNTIME_ONLY:
         _load_builtin_backends()
+
+    _load_runtime_extra()
 
     # Out-of-tree extensions opt into being loaded automatically at ``import tvm`` time
     # by declaring an entry point in the ``tvm.backends`` group:
