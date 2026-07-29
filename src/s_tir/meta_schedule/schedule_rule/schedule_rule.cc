@@ -310,9 +310,6 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
   ffi::Array<ScheduleRule> rules;
   rules.push_back(ScheduleRule::ApplyCustomRule());
   rules.push_back(ScheduleRule::InlineConstantScalars());
-  rules.push_back(ScheduleRule::AddRFactor(
-      /*max_jobs_per_core=*/16,
-      /*max_innermost_factor=*/static_cast<int64_t>(64)));
   auto current_target = tvm::Target::Current();
 
   // Spatial intrinsics rules
@@ -329,8 +326,6 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
       // Skip add_relu kernels; not handled by this rule set
       continue;
     }
-    TVM_PY_LOG(INFO, logger) << "Spatial kernel name " << intrin.first
-                                  << " tile: " << intrin.second;
     rules.push_back(ScheduleRule::SpatialTilingWithIntrin(
         /*intrin_name=*/intrin.first,
         /*structure=*/"SSSS",
@@ -350,7 +345,10 @@ ffi::Array<ScheduleRule> ScheduleRule::DefaultRISCV(const int vlen) {
       /*disallow_if_then_else=*/true,
       /*require_injective=*/true,
       /*require_ordered=*/true,
-      /*disallow_op=*/ffi::Array<ffi::String>{"tirx.exp", "tirx.sigmoid", "tirx.log", "tirx.tanh"}));
+      /*disallow_op=*/ffi::Array<ffi::String>{"tirx.exp"}));
+  rules.push_back(ScheduleRule::AddRFactor(
+      /*max_jobs_per_core=*/16,
+      /*max_innermost_factor=*/static_cast<int64_t>(64)));
 
   // Search for add_relus after inlining
   for (const auto& intrin : rvv_spatial_kernels_inventory) {
