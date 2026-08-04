@@ -816,7 +816,7 @@ class Vectorizer : public StmtMutator, public ExprFunctor<PrimExpr(const PrimExp
       // the index or the value will be broadcast out to this number
       // of lanes, depending on which has more lanes.
       int value_dtype_lanes = GetLanesOrVScaleFactor(value.ty());
-      bool is_last_index_scalable = last_index_dtype.IsScalableVector();
+      bool is_scalable = last_index_dtype.IsScalableVector() || value.ty().IsScalableVector();
       int total_lanes = std::max(index_lanes, value_dtype_lanes);
 
       TVM_FFI_ICHECK_EQ(total_lanes % other_index_lanes, 0)
@@ -824,14 +824,11 @@ class Vectorizer : public StmtMutator, public ExprFunctor<PrimExpr(const PrimExp
           << " lanes of storage location by changing the last index.";
       int last_index_lanes = total_lanes / other_index_lanes;
 
-      // Broadcast the last index such that the total number of index
-      // lanes matches the desired number.
-      indices.Set(indices.size() - 1, BroadcastTo(indices[indices.size() - 1], last_index_lanes,
-                                                  is_last_index_scalable));
+      indices.Set(indices.size() - 1, BroadcastTo(indices[indices.size() - 1], last_index_lanes, is_scalable));
 
       auto writer = store.CopyOnWrite();
       writer->indices = indices;
-      writer->value = BroadcastTo(value, total_lanes, is_last_index_scalable);
+      writer->value = BroadcastTo(value, total_lanes, is_scalable);
     }
 
     return store;
