@@ -69,30 +69,27 @@ def rvv_sigmoid_kernel(
 
     # ── implementation ────────────────────────────────────────────────────────
 
+    scalar_ty = getattr(T, dtype)
+
     ln2 = {16: 0.6931472, 32: 0.6931472, 64: 0.6931471805599453}[dt.bits]
     inv_ln2 = {16: 1.4426950, 32: 1.4426950408889634, 64: 1.4426950408889634}[dt.bits]
 
-    vec_one = T.broadcast(getattr(T, dtype)(1.0), T.vscale() * dtype_lanes)
-    vec_zero = T.broadcast(getattr(T, dtype)(0.0), T.vscale() * dtype_lanes)
-    vec_ln2 = T.broadcast(getattr(T, dtype)(ln2), T.vscale() * dtype_lanes)
-    vec_inv_ln2 = T.broadcast(getattr(T, dtype)(inv_ln2), T.vscale() * dtype_lanes)
+    vec_one = T.broadcast(scalar_ty(1.0), T.vscale() * dtype_lanes)
+    vec_zero = T.broadcast(scalar_ty(0.0), T.vscale() * dtype_lanes)
 
     # Coefficients for polynomial approximation of exp(-x) using Remez algorithm
-    vec_c6 = T.broadcast(getattr(T, dtype)(0.0013888941091214), T.vscale() * dtype_lanes)
-    vec_c5 = T.broadcast(getattr(T, dtype)(0.0083333325608882), T.vscale() * dtype_lanes)
-    vec_c4 = T.broadcast(getattr(T, dtype)(0.0416666666914562), T.vscale() * dtype_lanes)
-    vec_c3 = T.broadcast(getattr(T, dtype)(0.1666666666504284), T.vscale() * dtype_lanes)
-    vec_c2 = T.broadcast(getattr(T, dtype)(0.5000000000010834), T.vscale() * dtype_lanes)
-    vec_c1 = T.broadcast(getattr(T, dtype)(0.9999999999999124), T.vscale() * dtype_lanes)
-    vec_c0 = T.broadcast(getattr(T, dtype)(1.0000000000000002), T.vscale() * dtype_lanes)
+    vec_c6 = T.broadcast(scalar_ty(0.0013889), T.vscale() * dtype_lanes)
+    vec_c5 = T.broadcast(scalar_ty(0.0083333), T.vscale() * dtype_lanes)
+    vec_c4 = T.broadcast(scalar_ty(0.0416667), T.vscale() * dtype_lanes)
+    vec_c3 = T.broadcast(scalar_ty(0.1666667 if dt.bits == 16 else 0.1666666666504284), T.vscale() * dtype_lanes)
+    vec_c2 = T.broadcast(scalar_ty(0.5000000 if dt.bits == 16 else 0.5000000000010834), T.vscale() * dtype_lanes)
+    vec_c1 = T.broadcast(scalar_ty(1.0000000 if dt.bits == 16 else 0.9999999999999124), T.vscale() * dtype_lanes)
+    vec_c0 = T.broadcast(scalar_ty(1.0000000 if dt.bits == 16 else 1.0000000000000002), T.vscale() * dtype_lanes)
 
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
-    vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), T.vscale() * dtype_lanes)
 
-    # Exponent-safe bounds for the range-reduction argument, see EXP_ARG_MIN
-    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), T.vscale() * dtype_lanes)
-    vec_exp_hi = T.broadcast(getattr(T, dtype)(EXP_ARG_MAX[dt.bits]), T.vscale() * dtype_lanes)
-
+    # Passthroughs reuse an input: inactive lanes are never stored.
+    # Horner overwrites its dying accumulator and does not preserve tails.
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_sigmoid_impl(
@@ -115,30 +112,13 @@ def rvv_sigmoid_kernel(
             vec_neg_A = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfsub",
-                vec_broadcast,
+                vec_zero,
                 vec_zero,
                 vec_A,
                 *mask_args,
                 T.int64(n_elems),
             )
 
-            # Keep the argument inside the exponent-safe range, see EXP_ARG_MIN
-            vec_neg_A = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmax",
-                vec_broadcast,
-                vec_neg_A,
-                vec_exp_lo,
-                T.int64(n_elems),
-            )
-            vec_neg_A = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmin",
-                vec_broadcast,
-                vec_neg_A,
-                vec_exp_hi,
-                T.int64(n_elems),
-            )
 
             # ── Polynomial approximation of exp() ──────────────────
 
@@ -146,9 +126,9 @@ def rvv_sigmoid_kernel(
             vec_k = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
                 vec_neg_A,
-                vec_inv_ln2,
+                vec_neg_A,
+                scalar_ty(inv_ln2),
                 *mask_args,
                 T.int64(n_elems),
             )
@@ -157,7 +137,7 @@ def rvv_sigmoid_kernel(
             vec_k_int = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vfcvt.x.f.v",
-                vec_int_zero,
+                T.reinterpret(vec_int_dtype, vec_k),
                 vec_k,
                 *mask_args,
                 T.int64(n_elems),
@@ -165,30 +145,23 @@ def rvv_sigmoid_kernel(
             vec_k_float = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfcvt.f.x.v",
-                vec_broadcast,
+                T.reinterpret(vec_dtype, vec_k_int),
                 vec_k_int,
                 *mask_args,
                 T.int64(n_elems),
             )
 
             # r = -A - k * ln2
-            vec_k_ln2 = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmul",
-                vec_broadcast,
-                vec_k_float,
-                vec_ln2,
-                *mask_args,
-                T.int64(n_elems),
-            )
+            # Fused range reduction: r = argument - k * ln2.
             vec_r = T.call_llvm_intrin(
                 vec_dtype,
-                "llvm.riscv.vfsub",
-                vec_broadcast,
+                "llvm.riscv.vfnmsac",
                 vec_neg_A,
-                vec_k_ln2,
+                getattr(T, dtype)(ln2),
+                vec_k_float,
                 *mask_args,
                 T.int64(n_elems),
+                T.int64(1),
             )
 
             # Horner
@@ -197,111 +170,114 @@ def rvv_sigmoid_kernel(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
                 # vec_r * vec_c6 + vec_c5
-                vec_r,
                 vec_c6,
+                vec_r,
                 vec_c5,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),  # policy (ImmArg, tail-undisturbed)
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_5 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_6,
+                vec_r,
                 vec_c4,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_4 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_5,
+                vec_r,
                 vec_c3,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_3 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_4,
+                vec_r,
                 vec_c2,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_3,
+                vec_r,
                 vec_c1,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_2,
+                vec_r,
                 vec_c0,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
+
 
             # 2^k by bit manipulation
             exponent_bias = {16: 15, 32: 127, 64: 1023}[dt.bits]
-            mantissa_bits = {16: 10, 32: 23, 64: 52}[dt.bits]
+            mantissa_bits  = {16: 10, 32: 23,  64: 52 }[dt.bits]
             vec_bias = T.broadcast(T.Cast(f"int{dt.bits}", exponent_bias), T.vscale() * dtype_lanes)
-            vec_23 = T.broadcast(T.Cast(f"int{dt.bits}", mantissa_bits), T.vscale() * dtype_lanes)
+            vec_23 = T.broadcast(T.Cast(f"int{dt.bits}", mantissa_bits),  T.vscale() * dtype_lanes)
             vec_k_biased = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vadd",
-                vec_int_zero,
                 vec_k_int,
-                vec_bias,
+                vec_k_int,
+                T.int64(exponent_bias),
                 T.int64(n_elems),
             )
             vec_k_shifted = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vsll",
-                vec_int_zero,
+                vec_k_biased,
                 vec_k_biased,
                 vec_23,
                 T.int64(n_elems),
             )
             vec_2k = T.reinterpret(vec_dtype, vec_k_shifted)
 
+
             # final exp result = p * 2^k
             vec_exp = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
+                vec_p,
                 vec_p,
                 vec_2k,
                 *mask_args,
                 T.int64(n_elems),
             )
 
+
             vec_add = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfadd",
-                vec_broadcast,
                 vec_exp,
-                vec_one,
+                vec_exp,
+                scalar_ty(1.0),
                 *mask_args,
                 T.int64(n_elems),
             )
             vec_res = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfdiv",
-                vec_broadcast,
+                vec_one,
                 vec_one,
                 vec_add,
                 *mask_args,
@@ -315,7 +291,6 @@ def rvv_sigmoid_kernel(
                 T.tvm_access_ptr(T.type_annotation(dtype), B.data, B.elem_offset, n_elems, WRITE),
                 T.int64(n_elems),
             )
-
     # fmt: on
     return rvv_sigmoid_desc, rvv_sigmoid_impl
 
@@ -366,12 +341,10 @@ def rvv_log_kernel(
     # IEEE-754 layout constants
     exp_bias = {16: 15, 32: 127, 64: 1023}[dt.bits]
     mantissa_shift = {16: 10, 32: 23, 64: 52}[dt.bits]
-    exp_mask = {16: 0x1F, 32: 0xFF, 64: 0x7FF}[dt.bits]
-    sign_shift = dt.bits - 1
 
     import struct, math
     if dt.bits == 16:
-        # sqrt(2) in float16 bit pattern
+        # sqrt(2) in float16 bit pattern (via float32 intermediate)
         f32_bits = struct.unpack('<H', struct.pack('<e', math.sqrt(2)))[0]
         sqrt2_int = f32_bits
     elif dt.bits == 32:
@@ -381,8 +354,7 @@ def rvv_log_kernel(
 
     vlanes = T.vscale() * dtype_lanes
 
-    vec_ln2 = T.broadcast(getattr(T, dtype)(ln2), vlanes)
-    vec_one = T.broadcast(one, vlanes)
+    vec_ln2  = T.broadcast(getattr(T, dtype)(ln2), vlanes)
 
     vec_c6 = T.broadcast(c6, vlanes)
     vec_c5 = T.broadcast(c5, vlanes)
@@ -391,22 +363,16 @@ def rvv_log_kernel(
     vec_c2 = T.broadcast(c2, vlanes)
     vec_c1 = T.broadcast(c1, vlanes)
 
-    vec_fp_zero = T.broadcast(T.Cast(dtype, 0), vlanes)
-    vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), vlanes)
-    vec_one_int = T.broadcast(T.Cast(f"int{dt.bits}", 1), vlanes)
+    vec_fp_zero = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
 
-    vec_exp_bias_int = T.broadcast(T.Cast(f"int{dt.bits}", exp_bias), vlanes)
-    vec_mantissa_shift_int = T.broadcast(T.Cast(f"int{dt.bits}", mantissa_shift), vlanes)
-    vec_exp_mask_int = T.broadcast(T.Cast(f"int{dt.bits}", exp_mask), vlanes)
-    vec_sign_shift_int = T.broadcast(T.Cast(f"int{dt.bits}", sign_shift), vlanes)
-    vec_sqrt2_int = T.broadcast(T.Cast(f"int{dt.bits}", sqrt2_int), vlanes)
-    vec_all_ones_int = T.broadcast(T.Cast(f"int{dt.bits}", -1), vlanes)
 
+    # Passthroughs reuse an input: inactive lanes are never stored.
+    # Horner overwrites its dying accumulator and does not preserve tails.
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_log_impl(
-        A: T.Buffer((n_elems,), dtype, offset_factor=1),
-        B: T.Buffer((n_elems,), dtype, offset_factor=1),
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            B: T.Buffer((n_elems,), dtype, offset_factor=1),
     ) -> None:
         with T.sblock("root"):
             T.reads(A[0:n_elems])
@@ -420,132 +386,32 @@ def rvv_log_kernel(
                 T.int64(n_elems),
             )
 
-            # Extract biased exponent E
+            # Shift the bit interval so its exponent already includes the
+            # sqrt(2) adjustment. Positive normal inputs give the same m and E
+            # as extracting [1, 2) and conditionally halving the mantissa.
             vec_A_bits = T.reinterpret(vec_int_dtype, vec_A)
-
-            vec_exp_shifted = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vsrl",
-                vec_int_zero,
-                vec_A_bits,
-                vec_mantissa_shift_int,
+            vec_adjusted = T.call_llvm_intrin(
+                vec_int_dtype, "llvm.riscv.vadd", vec_A_bits, vec_A_bits,
+                T.int64((exp_bias << mantissa_shift) - (sqrt2_int - (1 << mantissa_shift))),
                 T.int64(n_elems),
             )
-            vec_Ebiased = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vand",
-                vec_int_zero,
-                vec_exp_shifted,
-                vec_exp_mask_int,
-                T.int64(n_elems),
+            vec_exponent = T.call_llvm_intrin(
+                vec_int_dtype, "llvm.riscv.vsrl", vec_adjusted, vec_adjusted,
+                T.int64(mantissa_shift), T.int64(n_elems),
             )
-            vec_E = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vsub",
-                vec_int_zero,
-                vec_Ebiased,
-                vec_exp_bias_int,
-                T.int64(n_elems),
+            vec_E_adj = T.call_llvm_intrin(
+                vec_int_dtype, "llvm.riscv.vsub", vec_exponent, vec_exponent,
+                T.int64(exp_bias), T.int64(n_elems),
             )
-
-            # Reconstruct mantissa m in [1, 2)
-            # m_bits = (A_bits & ~(exp_mask << mantissa_shift)) | (bias << mantissa_shift)
-            vec_exp_mask_shifted = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vsll",
-                vec_int_zero,
-                vec_exp_mask_int,
-                vec_mantissa_shift_int,
-                T.int64(n_elems),
-            )
-            vec_not_exp_mask = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vxor",
-                vec_int_zero,
-                vec_exp_mask_shifted,
-                vec_all_ones_int,
-                T.int64(n_elems),
-            )
-            vec_mantissa_cleared = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vand",
-                vec_int_zero,
-                vec_A_bits,
-                vec_not_exp_mask,
-                T.int64(n_elems),
-            )
-            vec_bias_shifted = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vsll",
-                vec_int_zero,
-                vec_exp_bias_int,
-                vec_mantissa_shift_int,
-                T.int64(n_elems),
-            )
-            vec_m_bits = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vor",
-                vec_int_zero,
-                vec_mantissa_cleared,
-                vec_bias_shifted,
-                T.int64(n_elems),
-            )
-
-            vec_diff = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vsub",
-                vec_int_zero,
-                vec_m_bits,
-                vec_sqrt2_int,
-                T.int64(n_elems),
-            )
-            # Arithmetic right shift by (bits-1)
-            vec_msb = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vsra",
-                vec_int_zero,
-                vec_diff,
-                vec_sign_shift_int,
-                T.int64(n_elems),
-            )
-            # ge_flag = msb + 1
-            vec_ge_flag = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vadd",
-                vec_int_zero,
-                vec_msb,
-                vec_one_int,
-                T.int64(n_elems),
-            )
-
-            # m_adj_bits = m_bits - (ge_flag << mantissa_shift)
-            vec_ge_shifted = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vsll",
-                vec_int_zero,
-                vec_ge_flag,
-                vec_mantissa_shift_int,
-                T.int64(n_elems),
+            vec_fraction = T.call_llvm_intrin(
+                vec_int_dtype, "llvm.riscv.vand", vec_adjusted, vec_adjusted,
+                T.int64((1 << mantissa_shift) - 1), T.int64(n_elems),
             )
             vec_m_adj_bits = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vsub",
-                vec_int_zero,
-                vec_m_bits,
-                vec_ge_shifted,
-                T.int64(n_elems),
+                vec_int_dtype, "llvm.riscv.vadd", vec_fraction, vec_fraction,
+                T.int64(sqrt2_int - (1 << mantissa_shift)), T.int64(n_elems),
             )
             vec_m_adj = T.reinterpret(vec_dtype, vec_m_adj_bits)
-
-            # E_adj = E + ge_flag
-            vec_E_adj = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vadd",
-                vec_int_zero,
-                vec_E,
-                vec_ge_flag,
-                T.int64(n_elems),
-            )
 
             # z = m_adj - 1.0 (z in [-0.2929, 0.4142])
             vec_z = T.call_llvm_intrin(
@@ -553,7 +419,7 @@ def rvv_log_kernel(
                 "llvm.riscv.vfsub",
                 vec_m_adj,
                 vec_m_adj,
-                vec_one,
+                one,
                 *mask_args,
                 T.int64(n_elems),
             )
@@ -563,62 +429,62 @@ def rvv_log_kernel(
             vec_tmp0 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_z,
                 vec_c6,
+                vec_z,
                 vec_c5,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             # tmp1 = z * tmp0 + c4
             vec_tmp1 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_z,
                 vec_tmp0,
+                vec_z,
                 vec_c4,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             # tmp2 = z * tmp1 + c3
             vec_tmp2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_z,
                 vec_tmp1,
+                vec_z,
                 vec_c3,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             # tmp3 = z * tmp2 + c2
             vec_tmp3 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_z,
                 vec_tmp2,
+                vec_z,
                 vec_c2,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             # tmp4 = z * tmp3 + c1
             vec_tmp4 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_z,
                 vec_tmp3,
+                vec_z,
                 vec_c1,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             # P(z) = z * tmp4
             vec_Pz = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_fp_zero,
+                vec_tmp4,
                 vec_tmp4,
                 vec_z,
                 *mask_args,
@@ -629,7 +495,7 @@ def rvv_log_kernel(
             vec_E_float = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfcvt.f.x.v",
-                vec_fp_zero,
+                T.reinterpret(vec_dtype, vec_E_adj),
                 vec_E_adj,
                 *mask_args,
                 T.int64(n_elems),
@@ -644,7 +510,7 @@ def rvv_log_kernel(
                 vec_Pz,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
 
             T.call_llvm_intrin(
@@ -696,8 +562,6 @@ def rvv_exp_kernel(
 
     ln2 = {16: 0.6931472, 32: 0.6931472, 64: 0.6931471805599453}[dt.bits]
     inv_ln2 = {16: 1.4426950, 32: 1.4426950408889634, 64: 1.4426950408889634}[dt.bits]
-    vec_ln2 = T.broadcast(getattr(T, dtype)(ln2), T.vscale() * dtype_lanes)
-    vec_inv_ln2 = T.broadcast(getattr(T, dtype)(inv_ln2), T.vscale() * dtype_lanes)
 
     # Coefficients for polynomial approximation of exp(-x) using Remez algorithm
     vec_c6 = T.broadcast(getattr(T, dtype)(0.0013888941091214), T.vscale() * dtype_lanes)
@@ -709,11 +573,9 @@ def rvv_exp_kernel(
     vec_c0 = T.broadcast(getattr(T, dtype)(1.0000000000000002), T.vscale() * dtype_lanes)
 
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
-    vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), T.vscale() * dtype_lanes)
 
-    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), T.vscale() * dtype_lanes)
-    vec_exp_hi = T.broadcast(getattr(T, dtype)(EXP_ARG_MAX[dt.bits]), T.vscale() * dtype_lanes)
-
+    # Passthroughs reuse an input: inactive lanes are never stored.
+    # Horner overwrites its dying accumulator and does not preserve tails.
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_exp_impl(
@@ -732,33 +594,16 @@ def rvv_exp_kernel(
                 T.int64(n_elems),
             )
 
-            # Keep the argument inside the exponent-safe range
-            vec_A = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmax",
-                vec_broadcast,
-                vec_A,
-                vec_exp_lo,
-                T.int64(n_elems),
-            )
-            vec_A = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmin",
-                vec_broadcast,
-                vec_A,
-                vec_exp_hi,
-                T.int64(n_elems),
-            )
 
             # ── Polynomial approximation of exp() ──────────────────
 
-            # k = -A * inv_ln2
+            # k = A * inv_ln2
             vec_k = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
                 vec_A,
-                vec_inv_ln2,
+                vec_A,
+                getattr(T, dtype)(inv_ln2),
                 *mask_args,
                 T.int64(n_elems),
             )
@@ -767,7 +612,7 @@ def rvv_exp_kernel(
             vec_k_int = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vfcvt.x.f.v",
-                vec_int_zero,
+                T.reinterpret(vec_int_dtype, vec_k),
                 vec_k,
                 *mask_args,
                 T.int64(n_elems),
@@ -775,30 +620,22 @@ def rvv_exp_kernel(
             vec_k_float = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfcvt.f.x.v",
-                vec_broadcast,
+                T.reinterpret(vec_dtype, vec_k_int),
                 vec_k_int,
                 *mask_args,
                 T.int64(n_elems),
             )
 
-            # r = -A - k * ln2
-            vec_k_ln2 = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmul",
-                vec_broadcast,
-                vec_k_float,
-                vec_ln2,
-                *mask_args,
-                T.int64(n_elems),
-            )
+            # Fused range reduction: r = argument - k * ln2.
             vec_r = T.call_llvm_intrin(
                 vec_dtype,
-                "llvm.riscv.vfsub",
-                vec_broadcast,
+                "llvm.riscv.vfnmsac",
                 vec_A,
-                vec_k_ln2,
+                getattr(T, dtype)(ln2),
+                vec_k_float,
                 *mask_args,
                 T.int64(n_elems),
+                T.int64(1),
             )
 
             # Horner
@@ -807,63 +644,64 @@ def rvv_exp_kernel(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
                 # vec_r * vec_c6 + vec_c5
-                vec_r,
                 vec_c6,
+                vec_r,
                 vec_c5,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),  # policy (ImmArg, tail-undisturbed)
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_5 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_6,
+                vec_r,
                 vec_c4,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_4 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_5,
+                vec_r,
                 vec_c3,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_3 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_4,
+                vec_r,
                 vec_c2,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_3,
+                vec_r,
                 vec_c1,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_2,
+                vec_r,
                 vec_c0,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
+
 
             # 2^k by bit manipulation
             exponent_bias = {16: 15, 32: 127, 64: 1023}[dt.bits]
@@ -873,31 +711,33 @@ def rvv_exp_kernel(
             vec_k_biased = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vadd",
-                vec_int_zero,
                 vec_k_int,
-                vec_bias,
+                vec_k_int,
+                T.int64(exponent_bias),
                 T.int64(n_elems),
             )
             vec_k_shifted = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vsll",
-                vec_int_zero,
                 vec_k_biased,
-                vec_23,
+                vec_k_biased,
+                T.int64(mantissa_bits),
                 T.int64(n_elems),
             )
             vec_2k = T.reinterpret(vec_dtype, vec_k_shifted)
+
 
             # final exp result = p * 2^k
             vec_exp = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
+                vec_p,
                 vec_p,
                 vec_2k,
                 *mask_args,
                 T.int64(n_elems),
             )
+
 
             T.call_llvm_intrin(
                 "void",
@@ -906,7 +746,6 @@ def rvv_exp_kernel(
                 T.tvm_access_ptr(T.type_annotation(dtype), B.data, B.elem_offset, n_elems, WRITE),
                 T.int64(n_elems),
             )
-
     # fmt: on
     return rvv_exp_desc, rvv_exp_impl
 
@@ -951,8 +790,6 @@ def rvv_exp_sub_kernel(
 
     ln2 = {16: 0.6931472, 32: 0.6931472, 64: 0.6931471805599453}[dt.bits]
     inv_ln2 = {16: 1.4426950, 32: 1.4426950408889634, 64: 1.4426950408889634}[dt.bits]
-    vec_ln2 = T.broadcast(getattr(T, dtype)(ln2), T.vscale() * dtype_lanes)
-    vec_inv_ln2 = T.broadcast(getattr(T, dtype)(inv_ln2), T.vscale() * dtype_lanes)
 
     # Coefficients for polynomial approximation of exp(-x) using Remez algorithm
     vec_c6 = T.broadcast(getattr(T, dtype)(0.0013888941091214), T.vscale() * dtype_lanes)
@@ -964,12 +801,9 @@ def rvv_exp_sub_kernel(
     vec_c0 = T.broadcast(getattr(T, dtype)(1.0000000000000002), T.vscale() * dtype_lanes)
 
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
-    vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), T.vscale() * dtype_lanes)
 
-    # Exponent-safe bounds
-    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), T.vscale() * dtype_lanes)
-    vec_exp_hi = T.broadcast(getattr(T, dtype)(EXP_ARG_MAX[dt.bits]), T.vscale() * dtype_lanes)
-
+    # Passthroughs reuse an input: inactive lanes are never stored.
+    # Horner overwrites its dying accumulator and does not preserve tails.
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_exp_sub_impl(
@@ -1008,33 +842,15 @@ def rvv_exp_sub_kernel(
                 T.int64(n_elems),
             )
 
-            # Keep the argument inside the exponent-safe range
-            vec_A = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmax",
-                vec_broadcast,
-                vec_A,
-                vec_exp_lo,
-                T.int64(n_elems),
-            )
-            vec_A = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmin",
-                vec_broadcast,
-                vec_A,
-                vec_exp_hi,
-                T.int64(n_elems),
-            )
-
             # ── Polynomial approximation of exp() ──────────────────
 
-            # k = -A * inv_ln2
+            # k = A * inv_ln2
             vec_k = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
                 vec_A,
-                vec_inv_ln2,
+                vec_A,
+                getattr(T, dtype)(inv_ln2),
                 *mask_args,
                 T.int64(n_elems),
             )
@@ -1043,7 +859,7 @@ def rvv_exp_sub_kernel(
             vec_k_int = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vfcvt.x.f.v",
-                vec_int_zero,
+                T.reinterpret(vec_int_dtype, vec_k),
                 vec_k,
                 *mask_args,
                 T.int64(n_elems),
@@ -1051,30 +867,22 @@ def rvv_exp_sub_kernel(
             vec_k_float = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfcvt.f.x.v",
-                vec_broadcast,
+                T.reinterpret(vec_dtype, vec_k_int),
                 vec_k_int,
                 *mask_args,
                 T.int64(n_elems),
             )
 
-            # r = -A - k * ln2
-            vec_k_ln2 = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmul",
-                vec_broadcast,
-                vec_k_float,
-                vec_ln2,
-                *mask_args,
-                T.int64(n_elems),
-            )
+            # Fused range reduction: r = argument - k * ln2.
             vec_r = T.call_llvm_intrin(
                 vec_dtype,
-                "llvm.riscv.vfsub",
-                vec_broadcast,
+                "llvm.riscv.vfnmsac",
                 vec_A,
-                vec_k_ln2,
+                getattr(T, dtype)(ln2),
+                vec_k_float,
                 *mask_args,
                 T.int64(n_elems),
+                T.int64(1),
             )
 
             # Horner
@@ -1083,63 +891,64 @@ def rvv_exp_sub_kernel(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
                 # vec_r * vec_c6 + vec_c5
-                vec_r,
                 vec_c6,
+                vec_r,
                 vec_c5,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),  # policy (ImmArg, tail-undisturbed)
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_5 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_6,
+                vec_r,
                 vec_c4,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_4 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_5,
+                vec_r,
                 vec_c3,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_3 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_4,
+                vec_r,
                 vec_c2,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_3,
+                vec_r,
                 vec_c1,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_2,
+                vec_r,
                 vec_c0,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
+
 
             # 2^k by bit manipulation
             exponent_bias = {16: 15, 32: 127, 64: 1023}[dt.bits]
@@ -1149,31 +958,33 @@ def rvv_exp_sub_kernel(
             vec_k_biased = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vadd",
-                vec_int_zero,
                 vec_k_int,
-                vec_bias,
+                vec_k_int,
+                T.int64(exponent_bias),
                 T.int64(n_elems),
             )
             vec_k_shifted = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vsll",
-                vec_int_zero,
                 vec_k_biased,
-                vec_23,
+                vec_k_biased,
+                T.int64(mantissa_bits),
                 T.int64(n_elems),
             )
             vec_2k = T.reinterpret(vec_dtype, vec_k_shifted)
+
 
             # final exp result = p * 2^k
             vec_exp = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
+                vec_p,
                 vec_p,
                 vec_2k,
                 *mask_args,
                 T.int64(n_elems),
             )
+
 
             T.call_llvm_intrin(
                 "void",
@@ -1182,7 +993,6 @@ def rvv_exp_sub_kernel(
                 T.tvm_access_ptr(T.type_annotation(dtype), B.data, B.elem_offset, n_elems, WRITE),
                 T.int64(n_elems),
             )
-
     # fmt: on
     return rvv_exp_sub_desc, rvv_exp_sub_impl
 
@@ -1230,8 +1040,6 @@ def rvv_tanh_kernel(
 
     ln2 = {16: 0.6931472, 32: 0.6931472, 64: 0.6931471805599453}[dt.bits]
     inv_ln2 = {16: 1.4426950, 32: 1.4426950408889634, 64: 1.4426950408889634}[dt.bits]
-    vec_ln2 = T.broadcast(getattr(T, dtype)(ln2), T.vscale() * dtype_lanes)
-    vec_inv_ln2 = T.broadcast(getattr(T, dtype)(inv_ln2), T.vscale() * dtype_lanes)
     vec_ones = T.broadcast(getattr(T, dtype)(1), T.vscale() * dtype_lanes)
     vec_twos = T.broadcast(getattr(T, dtype)(2), T.vscale() * dtype_lanes)
 
@@ -1245,11 +1053,13 @@ def rvv_tanh_kernel(
     vec_c0 = T.broadcast(getattr(T, dtype)(1.0000000000000002), T.vscale() * dtype_lanes)
 
     vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
-    vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), T.vscale() * dtype_lanes)
 
-    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), T.vscale() * dtype_lanes)
-    vec_exp_hi = T.broadcast(getattr(T, dtype)(EXP_ARG_MAX[dt.bits]), T.vscale() * dtype_lanes)
+    EXP_ARG_MIN = {16: -9.7, 32: -87.0, 64: -708.0}
+    EXP_ARG_MAX = {16: 10.5, 32: 88.0, 64: 709.0}
 
+
+    # Passthroughs reuse an input: inactive lanes are never stored.
+    # Horner overwrites its dying accumulator and does not preserve tails.
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_tanh_impl(
@@ -1271,7 +1081,7 @@ def rvv_tanh_kernel(
             vec_2A = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfadd",
-                vec_broadcast,
+                vec_A,
                 vec_A,
                 vec_A,
                 *mask_args,
@@ -1282,29 +1092,29 @@ def rvv_tanh_kernel(
             vec_2A = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmax",
-                vec_broadcast,
                 vec_2A,
-                vec_exp_lo,
+                vec_2A,
+                getattr(T, dtype)(EXP_ARG_MIN[dt.bits]),
                 T.int64(n_elems),
             )
             vec_2A = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmin",
-                vec_broadcast,
                 vec_2A,
-                vec_exp_hi,
+                vec_2A,
+                getattr(T, dtype)(EXP_ARG_MAX[dt.bits]),
                 T.int64(n_elems),
             )
 
             # ── Polynomial approximation of exp used for 2x
 
-            # k = -A * inv_ln2
+            # k = clamped(2*A) * inv_ln2
             vec_k = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
                 vec_2A,
-                vec_inv_ln2,
+                vec_2A,
+                getattr(T, dtype)(inv_ln2),
                 *mask_args,
                 T.int64(n_elems),
             )
@@ -1313,7 +1123,7 @@ def rvv_tanh_kernel(
             vec_k_int = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vfcvt.x.f.v",
-                vec_int_zero,
+                T.reinterpret(vec_int_dtype, vec_k),
                 vec_k,
                 *mask_args,
                 T.int64(n_elems),
@@ -1321,30 +1131,22 @@ def rvv_tanh_kernel(
             vec_k_float = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfcvt.f.x.v",
-                vec_broadcast,
+                T.reinterpret(vec_dtype, vec_k_int),
                 vec_k_int,
                 *mask_args,
                 T.int64(n_elems),
             )
 
-            # r = -A - k * ln2
-            vec_k_ln2 = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmul",
-                vec_broadcast,
-                vec_k_float,
-                vec_ln2,
-                *mask_args,
-                T.int64(n_elems),
-            )
+            # Fused range reduction: r = argument - k * ln2.
             vec_r = T.call_llvm_intrin(
                 vec_dtype,
-                "llvm.riscv.vfsub",
-                vec_broadcast,
+                "llvm.riscv.vfnmsac",
                 vec_2A,
-                vec_k_ln2,
+                getattr(T, dtype)(ln2),
+                vec_k_float,
                 *mask_args,
                 T.int64(n_elems),
+                T.int64(1),
             )
 
             # Horner
@@ -1353,62 +1155,62 @@ def rvv_tanh_kernel(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
                 # vec_r * vec_c6 + vec_c5
-                vec_r,
                 vec_c6,
+                vec_r,
                 vec_c5,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),  # policy (ImmArg, tail-undisturbed)
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_5 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_6,
+                vec_r,
                 vec_c4,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_4 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_5,
+                vec_r,
                 vec_c3,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_3 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_4,
+                vec_r,
                 vec_c2,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_3,
+                vec_r,
                 vec_c1,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_2,
+                vec_r,
                 vec_c0,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
 
             # 2^k by bit manipulation
@@ -1419,17 +1221,17 @@ def rvv_tanh_kernel(
             vec_k_biased = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vadd",
-                vec_int_zero,
                 vec_k_int,
-                vec_bias,
+                vec_k_int,
+                T.int64(exponent_bias),
                 T.int64(n_elems),
             )
             vec_k_shifted = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vsll",
-                vec_int_zero,
                 vec_k_biased,
-                vec_23,
+                vec_k_biased,
+                T.int64(mantissa_bits),
                 T.int64(n_elems),
             )
             vec_2k = T.reinterpret(vec_dtype, vec_k_shifted)
@@ -1438,7 +1240,7 @@ def rvv_tanh_kernel(
             vec_exp = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
+                vec_p,
                 vec_p,
                 vec_2k,
                 *mask_args,
@@ -1449,9 +1251,9 @@ def rvv_tanh_kernel(
             vec_denominator = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfadd",
-                vec_broadcast,
                 vec_exp,
-                vec_ones,
+                vec_exp,
+                getattr(T, dtype)(1),
                 *mask_args,
                 T.int64(n_elems)
             )
@@ -1460,7 +1262,7 @@ def rvv_tanh_kernel(
             vec_div = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfdiv",
-                vec_broadcast,
+                vec_twos,
                 vec_twos,
                 vec_denominator,
                 *mask_args,
@@ -1471,7 +1273,7 @@ def rvv_tanh_kernel(
             vec_res = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfsub",
-                vec_broadcast,
+                vec_ones,
                 vec_ones,
                 vec_div,
                 *mask_args,
@@ -1533,8 +1335,6 @@ def rvv_erf_kernel(
 
     vec_one = T.broadcast(getattr(T, dtype)(1.0), vlanes)
     vec_zero = T.broadcast(getattr(T, dtype)(0.0), vlanes)
-    vec_ln2 = T.broadcast(getattr(T, dtype)(ln2), vlanes)
-    vec_inv_ln2 = T.broadcast(getattr(T, dtype)(inv_ln2), vlanes)
 
     # Coefficients for polynomial approximation of exp(-y); identical Remez
     # fit reused verbatim from rvv_exp_kernel / rvv_sigmoid_kernel / rvv_tanh_kernel
@@ -1547,28 +1347,19 @@ def rvv_erf_kernel(
     vec_c0 = T.broadcast(getattr(T, dtype)(1.0000000000000002), vlanes)
 
     # Abramowitz & Stegun 7.1.26 rational-polynomial coefficients
-    vec_pc = T.broadcast(getattr(T, dtype)(0.3275911), vlanes)
     vec_a1 = T.broadcast(getattr(T, dtype)(0.254829592), vlanes)
     vec_a2 = T.broadcast(getattr(T, dtype)(-0.284496736), vlanes)
     vec_a3 = T.broadcast(getattr(T, dtype)(1.421413741), vlanes)
     vec_a4 = T.broadcast(getattr(T, dtype)(-1.453152027), vlanes)
     vec_a5 = T.broadcast(getattr(T, dtype)(1.061405429), vlanes)
 
-    vec_broadcast = T.broadcast(T.Cast(dtype, 0), vlanes)
-    vec_int_zero = T.broadcast(T.Cast(f"int{dt.bits}", 0), vlanes)
+    vec_broadcast = T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes)
 
     # Exponent-safe bounds for the range-reduction argument, erf only uses lower bound
-    vec_exp_lo = T.broadcast(getattr(T, dtype)(EXP_ARG_MIN[dt.bits]), vlanes)
+    EXP_ARG_MIN = {16: -9.7, 32: -87.0, 64: -708.0}
 
-    # Sign-bit isolation constants for the final copysign(result, A) step —
-    # same bit-trick idiom as the mantissa/exponent manipulation in
-    # rvv_log_kernel, rather than relying on a `vfsgnj` intrinsic being
-    # registered in the fork.
-    sign_mask = -(1 << (dt.bits - 1))
-    not_sign_mask = ~sign_mask
-    vec_sign_mask_int = T.broadcast(T.Cast(f"int{dt.bits}", sign_mask), vlanes)
-    vec_not_sign_mask_int = T.broadcast(T.Cast(f"int{dt.bits}", not_sign_mask), vlanes)
-
+    # Passthroughs reuse an input: inactive lanes are never stored.
+    # Horner overwrites its dying accumulator and does not preserve tails.
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_erf_impl(
@@ -1587,31 +1378,17 @@ def rvv_erf_kernel(
                 T.int64(n_elems),
             )
 
-            # ── |A| and sign(A) via bit-clear/mask on the raw IEEE-754 bits ────
-            vec_A_bits = T.reinterpret(vec_int_dtype, vec_A)
-            vec_A_sign = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vand",
-                vec_int_zero,
-                vec_A_bits,
-                vec_sign_mask_int,
+            # Clear the sign without materializing integer mask vectors.
+            vec_absA = T.call_llvm_intrin(
+                vec_dtype, "llvm.riscv.vfsgnjx", vec_A, vec_A, vec_A,
                 T.int64(n_elems),
             )
-            vec_absA_bits = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vand",
-                vec_int_zero,
-                vec_A_bits,
-                vec_not_sign_mask_int,
-                T.int64(n_elems),
-            )
-            vec_absA = T.reinterpret(vec_dtype, vec_absA_bits)
 
             # ── -x^2 (sign-independent; computed straight from A, not |A|) ────
             vec_x2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
+                vec_A,
                 vec_A,
                 vec_A,
                 *mask_args,
@@ -1620,7 +1397,7 @@ def rvv_erf_kernel(
             vec_neg_x2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfsub",
-                vec_broadcast,
+                vec_zero,
                 vec_zero,
                 vec_x2,
                 *mask_args,
@@ -1630,9 +1407,9 @@ def rvv_erf_kernel(
             vec_neg_x2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmax",
-                vec_broadcast,
                 vec_neg_x2,
-                vec_exp_lo,
+                vec_neg_x2,
+                getattr(T, dtype)(EXP_ARG_MIN[dt.bits]),
                 T.int64(n_elems),
             )
 
@@ -1642,16 +1419,16 @@ def rvv_erf_kernel(
             vec_k = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
                 vec_neg_x2,
-                vec_inv_ln2,
+                vec_neg_x2,
+                getattr(T, dtype)(inv_ln2),
                 *mask_args,
                 T.int64(n_elems),
             )
             vec_k_int = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vfcvt.x.f.v",
-                vec_int_zero,
+                T.reinterpret(vec_int_dtype, vec_k),
                 vec_k,
                 *mask_args,
                 T.int64(n_elems),
@@ -1659,92 +1436,85 @@ def rvv_erf_kernel(
             vec_k_float = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfcvt.f.x.v",
-                vec_broadcast,
+                T.reinterpret(vec_dtype, vec_k_int),
                 vec_k_int,
                 *mask_args,
                 T.int64(n_elems),
             )
 
             # r = -x^2 - k * ln2
-            vec_k_ln2 = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfmul",
-                vec_broadcast,
-                vec_k_float,
-                vec_ln2,
-                *mask_args,
-                T.int64(n_elems),
-            )
+            # Fused range reduction: r = argument - k * ln2.
             vec_r = T.call_llvm_intrin(
                 vec_dtype,
-                "llvm.riscv.vfsub",
-                vec_broadcast,
+                "llvm.riscv.vfnmsac",
                 vec_neg_x2,
-                vec_k_ln2,
+                getattr(T, dtype)(ln2),
+                vec_k_float,
                 *mask_args,
                 T.int64(n_elems),
+                T.int64(1),
             )
 
             # Horner: p = c0 + r*(c1 + r*(c2 + r*(c3 + r*(c4 + r*(c5 + r*c6)))))
             vec_p_6 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_c6,
+                vec_r,
                 vec_c5,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_5 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_6,
+                vec_r,
                 vec_c4,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_4 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_5,
+                vec_r,
                 vec_c3,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_3 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_4,
+                vec_r,
                 vec_c2,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p_2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_3,
+                vec_r,
                 vec_c1,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_p = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_r,
                 vec_p_2,
+                vec_r,
                 vec_c0,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
 
             # 2^k by bit manipulation
@@ -1755,17 +1525,17 @@ def rvv_erf_kernel(
             vec_k_biased = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vadd",
-                vec_int_zero,
                 vec_k_int,
-                vec_bias,
+                vec_k_int,
+                T.int64(exponent_bias),
                 T.int64(n_elems),
             )
             vec_k_shifted = T.call_llvm_intrin(
                 vec_int_dtype,
                 "llvm.riscv.vsll",
-                vec_int_zero,
                 vec_k_biased,
-                vec_mshift,
+                vec_k_biased,
+                T.int64(mantissa_bits),
                 T.int64(n_elems),
             )
             vec_2k = T.reinterpret(vec_dtype, vec_k_shifted)
@@ -1773,7 +1543,7 @@ def rvv_erf_kernel(
             vec_exp_neg_x2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
+                vec_p,
                 vec_p,
                 vec_2k,
                 *mask_args,
@@ -1785,16 +1555,16 @@ def rvv_erf_kernel(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
                 vec_absA,
-                vec_pc,
+                getattr(T, dtype)(0.3275911),
                 vec_one,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_t = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfdiv",
-                vec_broadcast,
+                vec_one,
                 vec_one,
                 vec_denom,
                 *mask_args,
@@ -1805,92 +1575,70 @@ def rvv_erf_kernel(
             vec_q4 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_t,
                 vec_a5,
+                vec_t,
                 vec_a4,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_q3 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_t,
                 vec_q4,
+                vec_t,
                 vec_a3,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_q2 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_t,
                 vec_q3,
+                vec_t,
                 vec_a2,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_q1 = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmadd",
-                vec_t,
                 vec_q2,
+                vec_t,
                 vec_a1,
                 *mask_args,
                 T.int64(n_elems),
-                T.int64(0),
+                T.int64(1), # tail-agnostic: only active lanes are stored
             )
             vec_poly = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vfmul",
-                vec_broadcast,
+                vec_t,
                 vec_t,
                 vec_q1,
                 *mask_args,
                 T.int64(n_elems),
             )
 
-            # y = 1 - poly * exp(-x^2); y holds erf(|A|), always in [0, 1)
-            vec_poly_exp = T.call_llvm_intrin(
+            # Fused y = 1 - poly * exp(-x^2).
+            vec_y = T.call_llvm_intrin(
                 vec_dtype,
-                "llvm.riscv.vfmul",
-                vec_broadcast,
+                "llvm.riscv.vfnmsac",
+                vec_one,
                 vec_poly,
                 vec_exp_neg_x2,
                 *mask_args,
                 T.int64(n_elems),
-            )
-            vec_y = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfsub",
-                vec_broadcast,
-                vec_one,
-                vec_poly_exp,
-                *mask_args,
-                T.int64(n_elems),
+                T.int64(1),
             )
 
-            # ── erf(A) = copysign(y, A): clear y's sign bit, OR in A's sign ────
-            vec_y_bits = T.reinterpret(vec_int_dtype, vec_y)
-            vec_y_abs_bits = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vand",
-                vec_int_zero,
-                vec_y_bits,
-                vec_not_sign_mask_int,
+            # Copy A's sign, including negative zero.
+            vec_res = T.call_llvm_intrin(
+                vec_dtype, "llvm.riscv.vfsgnj", vec_y, vec_y, vec_A,
                 T.int64(n_elems),
             )
-            vec_res_bits = T.call_llvm_intrin(
-                vec_int_dtype,
-                "llvm.riscv.vor",
-                vec_int_zero,
-                vec_y_abs_bits,
-                vec_A_sign,
-                T.int64(n_elems),
-            )
-            vec_res = T.reinterpret(vec_dtype, vec_res_bits)
 
             T.call_llvm_intrin(
                 "void",
