@@ -223,11 +223,12 @@ def rvv_add_kernel(
     # fmt: off
     @T.prim_func(s_tir=True)
     def rvv_add_impl(
-        A: T.Buffer((n_elems,), dtype, offset_factor=1),
-        B: T.Buffer((n_elems,), dtype, offset_factor=1),
-        C: T.Buffer((n_elems,), dtype, offset_factor=1),
+            A: T.Buffer((n_elems,), dtype, offset_factor=1),
+            B: T.Buffer((n_elems,), dtype, offset_factor=1),
+            C: T.Buffer((n_elems,), dtype, offset_factor=1),
     ) -> None:
         with T.sblock("root"):
+            T.sblock_attr({"meta_schedule_inline_rule": "disable"})
             T.reads(A[0:n_elems], B[0:n_elems])
             T.writes(C[0:n_elems])
 
@@ -241,7 +242,7 @@ def rvv_add_kernel(
             vec_B = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vle",
-                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                vec_A,
                 T.tvm_access_ptr(T.type_annotation(dtype), B.data, B.elem_offset, n_elems, READ),
                 T.int64(n_elems),
             )
@@ -249,10 +250,10 @@ def rvv_add_kernel(
             vec_C = T.call_llvm_intrin(
                 vec_dtype,
                 add_intrin,
-                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                vec_A,
                 vec_A,
                 vec_B,
-                *mask_llvm(dtype),
+                *mask_args,
                 T.int64(n_elems),
             )
 
@@ -384,7 +385,7 @@ def rvv_add_relu_kernel(
             vec_B = T.call_llvm_intrin(
                 vec_dtype,
                 "llvm.riscv.vle",
-                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                vec_A,
                 T.tvm_access_ptr(T.type_annotation(dtype), B.data, B.elem_offset, n_elems, READ),
                 T.int64(n_elems),
             )
@@ -392,7 +393,7 @@ def rvv_add_relu_kernel(
             vec_C = T.call_llvm_intrin(
                 vec_dtype,
                 add_intrin,
-                T.broadcast(T.Cast(dtype, 0), T.vscale() * dtype_lanes),
+                vec_A,
                 vec_A,
                 vec_B,
                 *mask_llvm(dtype),
@@ -514,6 +515,7 @@ def rvv_neg_kernel(
 
     # ── implementation ────────────────────────────────────────────────────────
     vec_broadcast = T.broadcast(T.Cast(signed_dtype, 0), T.vscale() * dtype_lanes)
+    is_float = dtype.startswith("float")
 
     # fmt: off
     @T.prim_func(s_tir=True)
@@ -533,23 +535,29 @@ def rvv_neg_kernel(
                 T.int64(n_elems),
             )
 
-            vec_neg_A = T.call_llvm_intrin(
-                vec_dtype,
-                "llvm.riscv.vfsub" if dtype.startswith("float") else "llvm.riscv.vsub",
-                T.broadcast(getattr(T, signed_dtype)(0), T.vscale() * dtype_lanes),
-                T.broadcast(getattr(T, signed_dtype)(0), T.vscale() * dtype_lanes),
-                vec_A,
-                *mask_llvm(signed_dtype),
-                T.int64(n_elems),
-            )
-
-            T.call_llvm_intrin(
-                "void",
-                "llvm.riscv.vse",
-                vec_neg_A,
-                T.tvm_access_ptr(T.type_annotation(out_dtype), B.data, B.elem_offset, n_elems, WRITE),
-                T.int64(n_elems),
-            )
+            if is_float:
+                # Flip the sign bit, including signed zero; no zero vector or
+                # rounding-mode setup is needed. Inactive lanes reuse A.
+                vec_neg_A = T.call_llvm_intrin(
+                    vec_dtype, "llvm.riscv.vfsgnjn", vec_A, vec_A, vec_A,
+                    T.int64(n_elems),
+                )
+                T.call_llvm_intrin(
+                    "void", "llvm.riscv.vse", vec_neg_A,
+                    T.tvm_access_ptr(T.type_annotation(out_dtype), B.data, B.elem_offset, n_elems, WRITE),
+                    T.int64(n_elems),
+                )
+            else:
+                # Reverse subtract with scalar zero maps directly to vneg.v.
+                vec_neg_A = T.call_llvm_intrin(
+                    vec_dtype, "llvm.riscv.vrsub", vec_A, vec_A, T.int64(0),
+                    T.int64(n_elems),
+                )
+                T.call_llvm_intrin(
+                    "void", "llvm.riscv.vse", vec_neg_A,
+                    T.tvm_access_ptr(T.type_annotation(out_dtype), B.data, B.elem_offset, n_elems, WRITE),
+                    T.int64(n_elems),
+                )
     # fmt: on
     return rvv_neg_desc, rvv_neg_impl
 
